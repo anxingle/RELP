@@ -70,7 +70,7 @@ def SN_list_df(df):
     print('df_dropDuplicate', df_dropDuplicate)
     SN_df_width = df_dropDuplicate.shape[1]
     if SN_df_width > 1:
-        # Import inside the function to break the circular dependency with utils_general
+        # 导入utils_general中的sort_columns_with_numbers功能
         from utils.utils_general import sort_columns_with_numbers
         df_dropDuplicate = sort_columns_with_numbers(df_dropDuplicate)
     return df_dropDuplicate
