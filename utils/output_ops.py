@@ -70,8 +70,6 @@ def SN_list_df(df):
     print('df_dropDuplicate', df_dropDuplicate)
     SN_df_width = df_dropDuplicate.shape[1]
     if SN_df_width > 1:
-        # 导入utils_general中的sort_columns_with_numbers功能
-        from utils.utils_general import sort_columns_with_numbers
         df_dropDuplicate = sort_columns_with_numbers(df_dropDuplicate)
     return df_dropDuplicate
 
@@ -82,7 +80,14 @@ def format_parametric_output_df(df, failure_mode, defect_output_format=None):
         df = df.copy()
         if 'Pic_Name' in df.columns and 'Filename' not in df.columns:
             df['Filename'] = df['Pic_Name']
-        df['Defect_Type'] = failure_mode
+            
+        # Only override Defect_Type if it is missing or empty
+        if 'Defect_Type' not in df.columns:
+            df['Defect_Type'] = failure_mode
+        else:
+            # Fill empty values with failure_mode
+            df['Defect_Type'] = df['Defect_Type'].fillna(failure_mode)
+            df['Defect_Type'] = df['Defect_Type'].replace('', failure_mode)
         if 'Defect_Area' in df.columns and 'DUT_Area' in df.columns and 'Defect Pct' not in df.columns:
             df['Defect Pct'] = (df['Defect_Area'] / df['DUT_Area']) * 100.0
         elif 'Defect_Area' in df.columns and 'DUT_Area' not in df.columns:
@@ -638,7 +643,8 @@ def parametric_output(main_folder_path, sub_folder_path, file_name, sheet_name, 
         try:
             with pd.ExcelFile(res_full_path) as xls:
                 if sheet_name in xls.sheet_names:
-                    existing_df = ConfigManager().get_sheet(sheet_name)
+                    # FIX: Read the sheet from the target Excel file, not from RELP_Configuration.xlsx
+                    existing_df = pd.read_excel(xls, sheet_name=sheet_name)
                     print(f"DEBUG: Found existing sheet '{sheet_name}' with columns: {existing_df.columns.tolist()}")
                     
                     # Align columns: Concatenate allows aligning by column name automatically
