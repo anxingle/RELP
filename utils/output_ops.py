@@ -61,6 +61,19 @@ def clustering_Kmeans(bbox, SN_DF, sorting_strategy):
     return cluster1_data, cluster2_data, cluster1_mean, cluster2_mean, clusters_arrays
 
 
+import re
+
+def sort_columns_with_numbers(df):
+    """
+    对 DataFrame 的列名进行包含数字的自然排序 (Natural Sort)
+    例如：['SN10', 'SN1', 'SN2'] -> ['SN1', 'SN2', 'SN10']
+    """
+    def natural_sort_key(s):
+        return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', str(s))]
+    
+    sorted_cols = sorted(df.columns, key=natural_sort_key)
+    return df[sorted_cols]
+
 def SN_list_df(df):
     columns = df.columns.tolist()
     column_2drop = [f for f in columns if 'SN' not in f]
