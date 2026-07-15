@@ -1002,19 +1002,42 @@ def match_reference_for_image(reference_df, image_path, product, generation, out
         print("DEBUG: Reference DataFrame is empty.")
         return {}
 
-    # 从图片路径中提取 Product_Side
-    product_side = extract_product_side_from_path(image_path)
-    if product_side:
-        print(f"DEBUG: Extracted Product_Side='{product_side}' from image path: {image_path}")
+    # 从图片路径中提取 Project Code 和 Product_Side
+    import re
+    project_code = None
+    product_side = None
+    if image_path:
+        path_parts = image_path.replace('\\', '/').split('/')
+        for part in path_parts:
+            part_lower = part.lower()
+            pc_match = re.search(r'\b([R][0-9]+[a-zA-Z]*)\b', part)
+            if pc_match:
+                project_code = pc_match.group(1)
+            side_match = re.search(r'\b(bottom side|left side|right side|rear side|front side|top side)\b', part_lower)
+            if side_match:
+                product_side = side_match.group(1)
+            else:
+                side_match2 = re.search(r'\bside[_-]?(\d+)\b', part_lower)
+                if side_match2:
+                    product_side = f"Side{side_match2.group(1)}"
+                    
+        # fallback product_side from existing extraction
+        if not product_side:
+            fallback_side = extract_product_side_from_path(image_path)
+            if fallback_side:
+                product_side = fallback_side
+
+    print(f"DEBUG: Extracted Project_Code='{project_code}', Product_Side='{product_side}' from image path: {image_path}")
 
     ref_cols_norm = {c: _norm(c) for c in reference_df.columns}
 
-    # 检查 Reference sheet 是否有 Product_Side 列
+    # 检查 Reference sheet 是否有相应的列
     has_product_side_col = any(ref_cols_norm[c] == 'productside' for c in reference_df.columns)
+    has_project_code_col = any(ref_cols_norm[c] == 'projectcode' for c in reference_df.columns)
 
-    # 第一步：尝试用 Product_Side 过滤（如果提供了 Product_Side 且 Reference sheet 有该列）
-    if product_side and has_product_side_col:
-        print(f"DEBUG: Trying to match Reference with Product_Side='{product_side}'")
+    # 第一步：尝试用 Project Code 和 Product_Side 过滤
+    if (project_code and has_project_code_col) or (product_side and has_product_side_col):
+        print(f"DEBUG: Trying to match Reference with Project_Code='{project_code}', Product_Side='{product_side}'")
 
         # 先按 Product 过滤
         ref_prod_col = next((c for c in reference_df.columns if ref_cols_norm[c] == 'product'), None)
@@ -1026,10 +1049,20 @@ def match_reference_for_image(reference_df, image_path, product, generation, out
             if ref_gen_col and not ref_row_df.empty and generation:
                 ref_row_df = ref_row_df[ref_row_df[ref_gen_col].astype(str).apply(_norm) == _norm(generation)]
 
+            # 再按 Project Code 过滤
+            if has_project_code_col and project_code and not ref_row_df.empty:
+                project_code_col = next((c for c in reference_df.columns if ref_cols_norm[c] == 'projectcode'), None)
+                if project_code_col:
+                    pc_mask = ref_row_df[project_code_col].astype(str).apply(_norm) == _norm(project_code)
+                    filtered_by_pc = ref_row_df[pc_mask]
+                    if not filtered_by_pc.empty:
+                        ref_row_df = filtered_by_pc
+                        print(f"DEBUG: Filtered Reference by Project_Code='{project_code}'")
+
             # 最后按 Product_Side 过滤
             if not ref_row_df.empty:
                 product_side_col = next((c for c in reference_df.columns if ref_cols_norm[c] == 'productside'), None)
-                if product_side_col:
+                if product_side_col and product_side:
                     # 尝试精确匹配
                     side_mask = ref_row_df[product_side_col].astype(str).apply(_norm) == _norm(product_side)
                     filtered_by_side = ref_row_df[side_mask]
@@ -1041,19 +1074,21 @@ def match_reference_for_image(reference_df, image_path, product, generation, out
                         filtered_by_side = ref_row_df[side_mask]
 
                     if not filtered_by_side.empty:
-                        ref_row = filtered_by_side.iloc[0]
+                        ref_row_df = filtered_by_side
                         print(f"DEBUG: Found Reference row with Product_Side='{product_side}'")
-
-                        # 填充 Reference 参数
-                        reference_params = populate_reference_params_from_row(
-                            reference_df=reference_df,
-                            ref_row=ref_row,
-                            output_config=output_config if output_config else []
-                        )
-                        print(f"DEBUG: Reference Params with Product_Side: {reference_params}")
-                        return reference_params
                     else:
-                        print(f"DEBUG: No Reference row found with Product_Side='{product_side}', falling back to Product+Generation match")
+                        print(f"DEBUG: No Reference row found with Product_Side='{product_side}', but keeping current rows")
+
+                if not ref_row_df.empty:
+                    ref_row = ref_row_df.iloc[0]
+                    # 填充 Reference 参数
+                    reference_params = populate_reference_params_from_row(
+                        reference_df=reference_df,
+                        ref_row=ref_row,
+                        output_config=output_config if output_config else []
+                    )
+                    print(f"DEBUG: Reference Params matched: {reference_params}")
+                    return reference_params
 
     # 第二步：回退到只用 Product + Generation 匹配（现有逻辑）
     print(f"DEBUG: Matching Reference with Product='{product}', Generation='{generation}'")
