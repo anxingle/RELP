@@ -60,36 +60,176 @@ def extract_zip_without_macosx(zip_path, extract_to):
     except Exception as e:
         print(f"Error extracting {zip_path}: {e}")
 
+AC_USERNAME = "lin_hua" #input your username of AC
+
 def check_and_renew_kerberos_ticket():
     """
-    Checks if the Kerberos ticket is valid and attempts to renew/re-login if necessary.
-    This function assumes 'kinit' is available and configured for the user.
+    Checks if the Kerberos ticket is valid and attempts to auto-login if expired.
+    Tries 'appleconnect' CLI first, then falls back to 'kinit' with expect.
     """
-    try:
-        # Check if klist returns successfully
-        subprocess.check_call(['klist', '-s'])
-        # print("Kerberos ticket is valid.")
-        
-        # 即使 ticket 是 valid 的，我们也尝试续期，以确保长时间运行不断线
-        # 使用丢弃输出的方式，避免污染控制台
-        try:
-            subprocess.check_call(['kinit', '-R'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except:
-            pass
-            
+
+    # Helper to get current timestamp for logging
+    def get_log_time():
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # 1. 检查票据是否有效 (检查是否还有至少 10 分钟有效期，避免临界点失效)
+    # klist -s 仅在票据有效时返回 0
+    if subprocess.call(["klist", "-s"]) == 0:
+        print(
+            f"[{get_log_time()}] [Auth Check] Current Kerberos ticket is VALID. No action required."
+        )
         return True
-    except subprocess.CalledProcessError:
-        print("Kerberos ticket expired or invalid. Attempting to renew...")
+
+    print(
+        f"[{get_log_time()}] [Auth Check] Kerberos ticket EXPIRED or missing. Initiating auto-login..."
+    )
+
+    # 2. 读取密码
+    pass_file_path = os.path.expanduser("~/.my_ac_pass.txt")
+    if not os.path.exists(pass_file_path):
+        print(
+            f"[{get_log_time()}] [Auth Error] Password file not found at {pass_file_path}"
+        )
+        print("Please create it by running: echo 'your_password' > ~/.my_ac_pass.txt")
+        print("Then run: chmod 600 ~/.my_ac_pass.txt")
+        return False
+
+    try:
+        with open(pass_file_path, "r") as f:
+            password = f.read().strip()
+    except Exception as e:
+        print(f"[{get_log_time()}] [Auth Error] Error reading password file: {e}")
+        return False
+
+    # 3. 尝试使用 /usr/local/bin/appleconnect (首选方案)
+    APPLECONNECT_BIN = "/usr/local/bin/appleconnect"
+    if os.path.exists(APPLECONNECT_BIN):
+        print(
+            f"[{get_log_time()}] [Auth] Attempting to login using {APPLECONNECT_BIN}..."
+        )
+
+        # 使用全局配置的用户名
+        account = AC_USERNAME
+
+        expect_script = f'''
+        set timeout 30
+        spawn {APPLECONNECT_BIN} authenticate -a {account}
+        expect {{
+            -re "Password:" {{ send "{password}\\r"; exp_continue }}
+            -re "password:" {{ send "{password}\\r"; exp_continue }}
+            timeout {{ puts "TIMEOUT"; exit 1 }}
+            eof
+        }}
+        catch wait result
+        exit [lindex $result 3]
+        '''
+
         try:
-            # Attempt to renew using kinit -R (renew) first
-            subprocess.check_call(['kinit', '-R'])
-            print("Kerberos ticket renewed successfully.")
+            p = subprocess.Popen(
+                ["expect"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            stdout, stderr = p.communicate(input=expect_script)
+
+            if p.returncode == 0:
+                print(
+                    f"[{get_log_time()}] [Auth] Auto-login SUCCESSFUL using appleconnect CLI!"
+                )
+                return True
+            else:
+                print(
+                    f"[{get_log_time()}] [Auth Warning] appleconnect login failed (Code: {p.returncode}). Output: {stdout}"
+                )
+                # Fall through to kinit attempt
+        except Exception as e:
+            print(
+                f"[{get_log_time()}] [Auth Warning] Exception during appleconnect login: {e}"
+            )
+            # Fall through to kinit attempt
+
+    # 4. 如果 appleconnect 失败或不存在，尝试使用 kinit + expect (备用方案)
+    print(f"[{get_log_time()}] [Auth] Falling back to kinit via expect...")
+    PRINCIPAL = f"{AC_USERNAME}@APPLECONNECT.APPLE.COM"
+
+    expect_script_kinit = f'''
+    spawn kinit {PRINCIPAL}
+    expect "Password:"
+    send "{password}\\r"
+    expect eof
+    catch wait result
+    exit [lindex $result 3]
+    '''
+
+    try:
+        # 调用系统的 expect 命令
+        p = subprocess.Popen(
+            ["expect"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        stdout, stderr = p.communicate(input=expect_script_kinit)
+
+        if p.returncode == 0:
+            print(f"[{get_log_time()}] [Auth] Auto-login SUCCESSFUL via kinit!")
             return True
-        except subprocess.CalledProcessError:
-            print("Failed to renew ticket. Please log in manually using 'kinit' or AppleConnect.")
-            # In a fully automated environment, you might use a keytab here:
-            # subprocess.check_call(['kinit', '-k', '-t', '/path/to/keytab', 'principal'])
+        else:
+            print(
+                f"[{get_log_time()}] [Auth Error] Auto-login FAILED via kinit. Code: {p.returncode}"
+            )
+            print(f"Output: {stdout}")
             return False
+    except Exception as e:
+        print(
+            f"[{get_log_time()}] [Auth Error] Exception during auto-login via kinit: {e}"
+        )
+        return False
+
+    try:
+        with open(pass_file_path, "r") as f:
+            password = f.read().strip()
+    except Exception as e:
+        print(f"Error reading password file: {e}")
+        return False
+
+    # 3. 使用 expect 脚本进行交互式登录
+    # 这种方式会创建一个伪终端，绕过 kinit 的管道检测
+    expect_script = f'''
+    spawn kinit {PRINCIPAL}
+    expect "Password:"
+    send "{password}\\r"
+    expect eof
+    catch wait result
+    exit [lindex $result 3]
+    '''
+
+    try:
+        # 调用系统的 expect 命令
+        p = subprocess.Popen(
+            ["expect"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        stdout, stderr = p.communicate(input=expect_script)
+
+        if p.returncode == 0:
+            print("Auto-login successful! Ticket renewed.")
+            return True
+        else:
+            print(f"Auto-login failed. Code: {p.returncode}")
+            print(f"Output: {stdout}")
+            print(f"Error: {stderr}")
+            return False
+    except Exception as e:
+        print(f"Exception during auto-login: {e}")
+        return False
+
 
 def radar_download(base_dir, radar_id, time_threshold_hours, file_formats):
     """
@@ -268,7 +408,8 @@ def radar_download(base_dir, radar_id, time_threshold_hours, file_formats):
         except Exception as e:
             print(f"[Radar {radar_id}] An error occurred: {e}")
             # Check if the error is related to authentication
-            if "No AppleConnect session established" in str(e) or "expired" in str(e).lower():
+            error_str = str(e).lower()
+            if "no appleconnect session established" in error_str or "expired" in error_str or "-200050" in error_str or "取消" in error_str:
                 print(f"[Radar {radar_id}] Authentication error detected. Attempting to re-authenticate...")
                 if check_and_renew_kerberos_ticket():
                     print(f"[Radar {radar_id}] Re-authentication successful. Retrying in {retry_delay} seconds...")
