@@ -826,9 +826,16 @@ def monitor_radar_task(radar_id, frequency, file_formats, storage_path, product,
                         
                         # New format with Product and Generation
                         if product_normalized and generation_normalized:
-                            new_format_folder = os.path.join(os.getcwd(), "Result", str(radar_id), f"{product_normalized}_{generation_normalized}_{fm_normalized}_{fm_normalized}_Result")
+                            # Also remove ' ' inside the actual Result folder path logic, because RELP3_main uses space in Failure mode string if any
+                            fm_raw = str(failure_mode)
+                            new_format_folder = os.path.join(os.getcwd(), "Result", str(radar_id), f"{product_normalized}_{generation_normalized}_{fm_raw}_{fm_raw}_Result")
                             if os.path.exists(new_format_folder):
                                 final_result_folder = new_format_folder
+                            else:
+                                # Try globally in the Result folder (main outputs directly there instead of in radar_id subfolder)
+                                new_format_folder_global = os.path.join(os.getcwd(), "Result", f"{product_normalized}_{generation_normalized}_{fm_raw}_{fm_raw}_Result")
+                                if os.path.exists(new_format_folder_global):
+                                    final_result_folder = new_format_folder_global
                         
                         # Fallback to legacy format
                         if not final_result_folder:
@@ -836,14 +843,18 @@ def monitor_radar_task(radar_id, frequency, file_formats, storage_path, product,
                             if os.path.exists(result_folder_guess):
                                 final_result_folder = result_folder_guess
                             else:
-                                # Try glob pattern
-                                import glob
-                                pattern = os.path.join(os.getcwd(), "Result", str(radar_id), f"*_{fm_normalized}_Result")
-                                matching_folders = glob.glob(pattern)
-                                if matching_folders:
-                                    final_result_folder = matching_folders[0]
+                                result_folder_guess_global = os.path.join(os.getcwd(), "Result", f"{fm_normalized}_Result")
+                                if os.path.exists(result_folder_guess_global):
+                                    final_result_folder = result_folder_guess_global
                                 else:
-                                    final_result_folder = os.path.join(os.getcwd(), f"{fm_normalized}_Result")
+                                    # Try glob pattern
+                                    import glob
+                                    pattern = os.path.join(os.getcwd(), "Result", str(radar_id), f"*_{fm_normalized}_Result")
+                                    matching_folders = glob.glob(pattern)
+                                    if matching_folders:
+                                        final_result_folder = matching_folders[0]
+                                    else:
+                                        final_result_folder = os.path.join(os.getcwd(), f"{fm_normalized}_Result")
                     
                     # If that doesn't exist, maybe we can't upload.
                     if final_result_folder and os.path.exists(final_result_folder):
