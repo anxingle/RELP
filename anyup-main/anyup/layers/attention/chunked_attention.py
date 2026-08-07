@@ -37,6 +37,9 @@ class CrossAttention(nn.Module):
     def _slice_mask(self, mask, start, end):
         if mask is None:
             return None
+        # Ensure mask is contiguous on MPS/Metal to avoid sliceDimension range assertion error!
+        if mask.device.type == 'mps':
+            mask = mask.contiguous()
         # 2D: (tgt_len, src_len), 3D: (B*num_heads or B, tgt_len, src_len)
         if mask.dim() == 2:
             return mask[start:end, :]
@@ -108,9 +111,9 @@ class CrossAttentionBlock(nn.Module):
             attn_mask = compute_attention_mask(
                 *q.shape[-2:], *k.shape[-2:], window_size_ratio=self.window_ratio
             ).to(q.device)
-            # Fix MPS broadcast bug by explicitly making it 3D (num_heads * batch_size, L, S)
+            # Fix MPS broadcast bug by explicitly making it 3D (num_heads * batch_size, L, S) and contiguous
             num_heads = self.cross_attn.attention.num_heads
-            attn_mask = attn_mask.unsqueeze(0).expand(q.shape[0] * num_heads, -1, -1)
+            attn_mask = attn_mask.unsqueeze(0).expand(q.shape[0] * num_heads, -1, -1).contiguous()
         else:
             attn_mask = None
         b, _, h, w = q.shape

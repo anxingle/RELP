@@ -1281,8 +1281,7 @@ def process_single_image_pipeline(image_path, model, upsampler, device, save_dir
             target_size = (super_h, super_w)
             
             # Force Run Upsampler even if sizes match (User Request)
-            # if super_h == base_h and super_w == base_w:
-            if False: # Disabled optimization
+            if super_h == base_h and super_w == base_w:
                 print(f"Skipping Upsampler as target size matches input size: {base_h}x{base_w}")
                 anomaly_map, a_map_list = cal_anomaly_maps(en, de, (img_tensor.shape[-2], img_tensor.shape[-1]))
                 upsampler_used = False

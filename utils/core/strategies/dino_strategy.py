@@ -207,9 +207,11 @@ class DinoStrategy(AnalysisStrategy):
         if use_anyup:
              try:
                  print(f">>> [DinoStrategy] Loading AnyUp upsampler...")
-                 self.upsampler = dinov3_utils.load_anyup_model(self.device)
+                 self.upsampler = dinov3_utils.load_anyup_upsampler(self.device)
              except Exception as e:
-                 pass
+                 import traceback
+                 print(f">>> [DinoStrategy] Failed to load AnyUp upsampler: {e}")
+                 traceback.print_exc()
                  
         return flow_cfg
 
