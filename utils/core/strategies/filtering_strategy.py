@@ -141,7 +141,7 @@ class FilteringStrategy(AnalysisStrategy):
                 print(f">>> [Strategy] Reusing globally initialized SAM2 model")
             elif sam_ckpt:
                 import torch
-                device_str = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+                device_str = "cuda" if torch.cuda.is_available() else "cpu"
                 utils_general.init_sam2(sam_cfg, sam_ckpt, device=device_str)
                 sam2_model = utils_general.sam2_model
                 if hasattr(sam2_model, 'predict'):
@@ -174,8 +174,10 @@ class FilteringStrategy(AnalysisStrategy):
             from utils.base_utils import _norm
             fm_matches = fm_df[fm_df['Failure Mode'].astype(str).apply(_norm) == _norm(self.fm)]
             output_path_type = 'Result'
-            if not fm_matches.empty:
-                output_path_type = str(fm_matches.iloc[0]['Output_Path']) if pd.notna(fm_matches.iloc[0]['Output_Path']) else 'Result'
+            if not fm_matches.empty and pd.notna(fm_matches.iloc[0].get('Output_Path')):
+                output_path_type = str(fm_matches.iloc[0]['Output_Path']).strip()
+                if output_path_type.lower() == 'nan': output_path_type = 'Result'
+                
             if output_path_type == 'Result':
                 res_path = os.path.join(project_root, 'Result', f"{self.product}_{self.generation}_{self.fm}_{self.fm}_Result")
             else:
@@ -223,13 +225,56 @@ class FilteringStrategy(AnalysisStrategy):
             config_group=config_group,
             verbose=False
         )
+        
+        # Load Adaptive Gaussian config for this FM
+        adaptive_gaussian_df = self.cm.get_sheet('Adaptive Gaussian')
+        self.current_adaptive_gaussian_config = None
+        if not adaptive_gaussian_df.empty:
+            from utils.base_utils import _norm
+            ag_rows = adaptive_gaussian_df[adaptive_gaussian_df['Failure Mode'].astype(str).apply(_norm) == _norm(self.fm)]
+            if not ag_rows.empty:
+                if self.product:
+                    prod_col = next((c for c in ag_rows.columns if _norm(c) == 'product'), None)
+                    if prod_col:
+                        prod_match = ag_rows[ag_rows[prod_col].astype(str).apply(_norm) == _norm(self.product)]
+                        if not prod_match.empty: ag_rows = prod_match
+                if self.generation:
+                    gen_col = next((c for c in ag_rows.columns if _norm(c) == 'generation'), None)
+                    if gen_col:
+                        gen_match = ag_rows[ag_rows[gen_col].astype(str).apply(_norm) == _norm(self.generation)]
+                        if not gen_match.empty: ag_rows = gen_match
+                if not ag_rows.empty:
+                    self.current_adaptive_gaussian_config = ag_rows.iloc[0].to_dict()
+                    print(f">>> [FilteringStrategy] Loaded Adaptive Gaussian config: {self.current_adaptive_gaussian_config}")
 
         self._resolve_models()
         
-        # Legacy compatibility configurations
-        utils_general.Output_Config = ['Length']
-        utils_general.Reference_Params = {'Length': {'R': 200.0}}
-        utils_general.Gray_Scale_Params = {'Enabled': True, 'Mode': 'Gray Scale', 'Invert': 'Yes', 'Bining': '[0, 50, 90, 120, 150, 180, 210, 255]'}
+        # 删除旧的祖传硬编码，让其回退到 base_strategy 解析到的 Excel 配置
+        # utils_general.Output_Config = ['Length']
+        # utils_general.Reference_Params = {'Length': {'R': 200.0}}
+        # utils_general.Gray_Scale_Params = {'Enabled': True, 'Mode': 'Gray Scale', 'Invert': 'Yes', 'Bining': '[0, 50, 90, 120, 150, 180, 210, 255]'}
+
+        # 确定 Defect Output Format 和 Color Space 参数 (在循环外确定一次即可)
+        dof = 'individual'
+        if not self.defect_output_df.empty:
+            dof_row = self.defect_output_df[self.defect_output_df['Failure Mode'].astype(str).str.strip() == self.fm.strip()]
+            if not dof_row.empty:
+                dof = str(dof_row.iloc[0].get('Defect Output Format', 'individual')).strip().lower()
+                
+                # 动态读取 Excel 里的 Color Space Conversion 和 Binning 参数
+                mode_val = dof_row.iloc[0].get('Color Space Conversion')
+                bin_val = dof_row.iloc[0].get('Color Space Binning')
+                if pd.notna(mode_val) and str(mode_val).strip() != '':
+                    utils_general.Gray_Scale_Params = {
+                        'Enabled': True,
+                        'Mode': str(mode_val).strip(),
+                        'Invert': str(dof_row.iloc[0].get('Color Space Invertion', 'No')).strip(),
+                        'Bining': str(bin_val).strip() if pd.notna(bin_val) else ''
+                    }
+                    print(f">>> [FilteringStrategy] Dynamically loaded Gray Scale Params: {utils_general.Gray_Scale_Params}")
+                    
+        # 准备动态读取 Reference
+        reference_df = cfg_mgr.get_sheet('Reference')
 
         file_list = self.context.get('file_list', [])
         if not file_list:
@@ -251,6 +296,29 @@ class FilteringStrategy(AnalysisStrategy):
             file_name = os.path.basename(image_path)
             print(f"\n>>> [FilteringStrategy] Processing {file_name}...")
             
+            # --- 动态 Reference 匹配 ---
+            utils_general.Reference_Params.clear()
+            if reference_df is not None and not reference_df.empty:
+                try:
+                    from utils.output_ops import match_reference_for_image
+                    dynamic_ref = match_reference_for_image(
+                        reference_df, file_name, self.product, self.generation, getattr(utils_general, 'Output_Config', []), 'DUT'
+                    )
+                    if dynamic_ref: utils_general.Reference_Params.update(dynamic_ref)
+                except Exception as e:
+                    print(f">>> [FilteringStrategy] Warning: Failed to match dynamic reference: {e}")
+            
+            # --- Handle Relative Path ---
+            rel_path = os.path.relpath(os.path.dirname(image_path), download_path)
+            if rel_path == '.': rel_path = ''
+            
+            curr_inf_dir = os.path.join(inferred_pic_dir, rel_path)
+            os.makedirs(curr_inf_dir, exist_ok=True)
+            curr_res_dir = os.path.join(res_path, rel_path)
+            
+            curr_ref_dir = os.path.join(res_path, "reference", rel_path)
+            os.makedirs(curr_ref_dir, exist_ok=True)
+            
             inherited_data = self.context.get('inherited_data', {}).get(image_path)
             if inherited_data:
                 print(f">>> [FilteringStrategy] Using inherited mask and image from previous stage.")
@@ -269,8 +337,11 @@ class FilteringStrategy(AnalysisStrategy):
                 )
                 
                 if DUT_Corrected is None:
-                    print(f">>> [FilteringStrategy] DUT alignment failed! Skipping image: {file_name}")
-                    continue
+                    print(f">>> [FilteringStrategy] DUT alignment failed! Falling back to original raw image for: {file_name}")
+                    DUT_Corrected = image.copy()
+                    h, w = DUT_Corrected.shape[:2]
+                    Contour_Corrected = np.ones((h, w), dtype=np.uint8) * 255
+                    alignment_metadata = {}
                     
                 mask_filtered = Contour_Corrected.copy()
             
@@ -290,9 +361,29 @@ class FilteringStrategy(AnalysisStrategy):
                         original_img=DUT_Corrected,
                         operations=operations,
                         filtering_df=filtering_df,
-                        save_dir=inferred_pic_dir,
+                        save_dir=curr_ref_dir,
                         image_path=image_path,
                         contour_image=Contour_Corrected,
+                        adaptive_gaussian_config=self.current_adaptive_gaussian_config,
+                        defect_id_method=self.fm,
+                        mask_default=Contour_Corrected
+                    )
+                elif 'Adaptive Gaussian' in op_name or 'Global Threshold' in op_name or 'Global Threshhold' in op_name:
+                    op_params = op.get('params', [])
+                    print(f"  -> Applying {op_name} operation: {op_params}")
+                    # Construct operation dict manually
+                    actual_method = 'Global Threshold' if 'Global Thresh' in op_name else 'Adaptive Gaussian'
+                    operations = [{'method': actual_method, 'key': '', 'output_params': op_params}]
+                    
+                    mask_filtered, extra_results, _, _, updated_contour = utils_general.apply_filtering(
+                        mask_filtered=mask_filtered,
+                        original_img=DUT_Corrected,
+                        operations=operations,
+                        filtering_df=filtering_df,
+                        save_dir=curr_ref_dir,
+                        image_path=image_path,
+                        contour_image=Contour_Corrected,
+                        adaptive_gaussian_config=self.current_adaptive_gaussian_config,
                         defect_id_method=self.fm,
                         mask_default=Contour_Corrected
                     )
@@ -335,15 +426,28 @@ class FilteringStrategy(AnalysisStrategy):
                          gx1, gy1, gx2, gy2 = map(int, gdd['bbox'])
                          cv2.rectangle(debug_vis, (gx1, gy1), (gx2, gy2), (255, 0, 0), 2)
                          
-                debug_path = os.path.join(inferred_pic_dir, f"{os.path.splitext(file_name)[0]}_filtered_result.png")
-                cv2.imwrite(debug_path, debug_vis)
+                debug_path = os.path.join(curr_inf_dir, f"{os.path.splitext(file_name)[0]}_filtered_result.jpg")
+                
+                # 图片瘦身压缩逻辑：限制最大边长为 1920，且降低 JPEG 质量到 60
+                h_vis, w_vis = debug_vis.shape[:2]
+                max_dim = 1920
+                if max(h_vis, w_vis) > max_dim:
+                    scale_factor = max_dim / float(max(h_vis, w_vis))
+                    debug_vis = cv2.resize(debug_vis, (int(w_vis * scale_factor), int(h_vis * scale_factor)), interpolation=cv2.INTER_AREA)
+                
+                cv2.imwrite(debug_path, debug_vis, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
                 print(f"  -> Saved visualization to {debug_path}")
                 
                 for cnt in contours:
                     area = cv2.contourArea(cnt)
                     if area < 5: continue
                     
-                    p_dict = {'Picture_Name': file_name, 'Defect_Class': 'Defect'}
+                    p_dict = {
+                        'Picture_Name': file_name, 
+                        'Defect_Class': 'Defect',
+                        'Dir': rel_path,
+                        'Filename': file_name
+                    }
                     p_dict['Detected Defect'] = ", ".join(detected_labels) if detected_labels else ''
                     
                     single_mask = np.zeros_like(mask_uint8)
@@ -362,7 +466,7 @@ class FilteringStrategy(AnalysisStrategy):
                             is_line_shape=False,
                             image=DUT_Corrected,
                             gray_scale_params=utils_general.Gray_Scale_Params,
-                            output_dir=res_path,
+                            output_dir=curr_res_dir,
                             image_filename=image_path,
                             detector=self.dut_predictor
                         )
@@ -373,13 +477,13 @@ class FilteringStrategy(AnalysisStrategy):
                     parametric_results.append(p_dict)
             else:
                  print(f">>> [FilteringStrategy] No defect passed the filters for {file_name}.")
-                 parametric_results.append({'Picture_Name': file_name, 'Defect_Class': 'Pass'})
+                 parametric_results.append({'Picture_Name': file_name, 'Defect_Class': 'Pass', 'Dir': rel_path, 'Filename': file_name})
                  
         if parametric_results:
             df = output_ops.build_parametric_output_df(
                 data=parametric_results,
                 failure_mode=self.fm,
-                defect_output_format=self.defect_output_df
+                defect_output_format=dof
             )
             if not df.empty:
                 output_ops.parametric_output(

@@ -61,19 +61,6 @@ def clustering_Kmeans(bbox, SN_DF, sorting_strategy):
     return cluster1_data, cluster2_data, cluster1_mean, cluster2_mean, clusters_arrays
 
 
-import re
-
-def sort_columns_with_numbers(df):
-    """
-    对 DataFrame 的列名进行包含数字的自然排序 (Natural Sort)
-    例如：['SN10', 'SN1', 'SN2'] -> ['SN1', 'SN2', 'SN10']
-    """
-    def natural_sort_key(s):
-        return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', str(s))]
-    
-    sorted_cols = sorted(df.columns, key=natural_sort_key)
-    return df[sorted_cols]
-
 def SN_list_df(df):
     columns = df.columns.tolist()
     column_2drop = [f for f in columns if 'SN' not in f]
@@ -130,8 +117,8 @@ def format_parametric_output_df(df, failure_mode, defect_output_format=None):
                 'Length_Ratio',
                 'Width_Ratio',
                 'Ratio_Length',
-                'Ratio_Width',
-                'Curved Line Length'
+                'Ratio_Width'
+                # 注意：移除了 'Curved Line Length'，因为 Fraying 等缺陷在 Combined 模式下依然需要它！
             ]
             df = df.drop(columns=[c for c in drop_cols if c in df.columns])
         # Defect_ID from 'Defect' column if available
@@ -172,6 +159,127 @@ def resolve_sn_from_excel(source_path):
     except Exception as e:
         print(f"Warning: resolve_sn_from_excel failed: {e}")
         return None
+
+
+def extract_parametric_results(defect_mask, original_img, file_name, root_dir, 
+                               defect_output_format, dut_area=1.0, defect_class='Defect',
+                               ref_params=None, output_config=None, gray_scale_params=None,
+                               component_boxes=None, penalty_mask=None, penalty_multiplier=1.0,
+                               filtering_df=None):
+    """
+    通用特征提取器 (Universal Parametric Extractor):
+    将任意算法得出的缺陷掩码 (defect_mask) 转换为标准化的 Parametric 结果字典列表。
+    自动处理 Combined (全局聚合) 和 Individual (独立轮廓) 逻辑。
+    """
+    import cv2
+    import numpy as np
+    
+    parametric_results = []
+    if defect_mask is None or not np.any(defect_mask):
+        return parametric_results
+        
+    defect_mask_uint8 = (defect_mask > 0).astype(np.uint8) * 255
+    contours, _ = cv2.findContours(defect_mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    dof = str(defect_output_format).strip().lower()
+    
+    if dof == 'combined' and len(contours) > 0:
+        # Combined 模式：将所有碎小的 Mask 当作一个庞大整体处理
+        # 修复：使用 cv2.countNonZero 而不是 cv2.contourArea，以防零散像素丢失
+        total_area = cv2.countNonZero(defect_mask_uint8)
+        defect_pct = (total_area / dut_area) * 100 if dut_area > 0 else 0
+        
+        dims_res_combined = calculate_parametric_dimensions(
+            defect_cnt=contours[0], # 使用最大的轮廓作为外接矩形近似
+            dut_dims=original_img.shape[:2],
+            ref_params=ref_params or {},
+            output_config=output_config or [],
+            contour_area_val=total_area,
+            ref_area=dut_area, # 真正把 DUT_Area 作为基准传入
+            ref_found=False,
+            defect_mask=defect_mask_uint8, # 传递合并的全局 Mask
+            image=original_img,
+            gray_scale_params=gray_scale_params,
+            filtering_df=filtering_df,
+            penalty_mask=penalty_mask,
+            penalty_multiplier=penalty_multiplier,
+            output_dir=root_dir,
+            image_filename=file_name
+        )
+        
+        p_dict = {
+            'Picture_Name': file_name,
+            'Defect_Class': defect_class,
+            'Area': total_area,
+            'Defect Pct': f"{defect_pct:.4f}%",
+            'Dir': root_dir,
+            'Filename': file_name
+        }
+        
+        if component_boxes and len(component_boxes) > 0:
+            dx, dy, dw, dh = cv2.boundingRect(defect_mask_uint8)
+            cnt_area = dw * dh
+            best_overlap = 0
+            detected_component = ""
+            for box in component_boxes:
+                gx1, gy1, gx2, gy2 = map(int, box[:4])
+                ix1, iy1 = max(dx, gx1), max(dy, gy1)
+                ix2, iy2 = min(dx + dw, gx2), min(dy + dh, gy2)
+                inter_w, inter_h = max(0, ix2 - ix1), max(0, iy2 - iy1)
+                if cnt_area > 0:
+                    overlap_ratio = (inter_w * inter_h) / cnt_area
+                    if overlap_ratio >= 0.3 and overlap_ratio > best_overlap:
+                        if (gx2 - gx1) * (gy2 - gy1) < (original_img.shape[0] * original_img.shape[1] * 0.9):
+                            best_overlap = overlap_ratio
+                            detected_component = box[4] if len(box) > 4 else "Component"
+            if detected_component:
+                p_dict['Detected Defect'] = detected_component
+
+        p_dict.update(dims_res_combined)
+        parametric_results.append(p_dict)
+        
+    else:
+        # Individual 模式：逐个提取并分析独立的轮廓
+        for i, contour in enumerate(contours):
+            contour_area = cv2.contourArea(contour)
+            if contour_area == 0: continue
+            
+            single_mask = np.zeros_like(defect_mask_uint8)
+            cv2.drawContours(single_mask, [contour], -1, 255, -1)
+            
+            defect_pct = (contour_area / dut_area) * 100 if dut_area > 0 else 0
+            
+            dims_res_single = calculate_parametric_dimensions(
+                defect_cnt=contour,
+                dut_dims=original_img.shape[:2],
+                ref_params=ref_params or {},
+                output_config=output_config or [],
+                contour_area_val=contour_area,
+                ref_area=dut_area, # 真正把 DUT_Area 作为基准传入
+                ref_found=False,
+                defect_mask=single_mask, # 仅传递这一个轮廓的 Mask
+                image=original_img,
+                gray_scale_params=gray_scale_params,
+                filtering_df=filtering_df,
+                penalty_mask=penalty_mask,
+                penalty_multiplier=penalty_multiplier,
+                output_dir=root_dir,
+                image_filename=file_name
+            )
+            
+            p_dict = {
+                'Picture_Name': file_name,
+                'Defect_Class': defect_class,
+                'Area': contour_area,
+                'Defect Pct': f"{defect_pct:.4f}%",
+                'Contour': f"Contour_{i+1}",
+                'Dir': root_dir,
+                'Filename': file_name
+            }
+            p_dict.update(dims_res_single)
+            parametric_results.append(p_dict)
+            
+    return parametric_results
 
 
 def build_parametric_output_df(data, failure_mode, defect_output_format,
@@ -279,13 +387,33 @@ def build_parametric_output_df(data, failure_mode, defect_output_format,
                 use_defect_pct = scoring_setting.get('defect_pct', True)
                 
                 if bin_cols:
-                    n_bins = len(bin_cols)
+                    import re
+                    
+                    # Initialize all possible weight columns with NaNs first
+                    for col in bin_cols:
+                        range_match = re.search(r'\[(\d+\.?\d*-\d+\.?\d*)\]', str(col))
+                        if range_match:
+                            weight_name = f"Weight[{range_match.group(1)}]"
+                            df[weight_name] = np.nan
 
-                    # Generate weights and calculate scores
-                    weights = scoring_utils.exponential_decay_weights(n_bins, max_weight, decay_rate, reverse, min_weight=min_weight)
                     weighted_scores = []
                     
                     for idx, row in df.iterrows():
+                        # Determine if this row needs a specific scoring setting override
+                        row_scoring_setting = scoring_setting
+                        # Let's extract any inline scoring setting if passed in the dict via _scoring_setting
+                        if '_scoring_setting' in row and isinstance(row['_scoring_setting'], dict):
+                            row_scoring_setting = row['_scoring_setting']
+                            
+                        r_max_weight = row_scoring_setting.get('max_weight', 1.0)
+                        r_decay_rate = row_scoring_setting.get('decay_rate', 0.5)
+                        r_reverse = row_scoring_setting.get('reverse', True)
+                        r_min_weight = row_scoring_setting.get('min_weight', None)
+                        r_use_defect_pct = row_scoring_setting.get('defect_pct', True)
+                        r_multiplier = row_scoring_setting.get('multiplier', 1.0)
+                        r_multiplier_column = row_scoring_setting.get('multiplier_column', None)
+                        r_roi_coefficient = row_scoring_setting.get('roi_coefficient', 1.0)
+                        
                         # Check if this is a no_detection record (Defect_ID = -1)
                         defect_id = row.get('Defect_ID', None)
                         if defect_id == -1:
@@ -294,9 +422,43 @@ def build_parametric_output_df(data, failure_mode, defect_output_format,
                             weighted_scores.append(0)
                             continue
                         
-                        weighted_sum = sum(float(row.get(col, 0) or 0) * weights[i] for i, col in enumerate(bin_cols))
+                        # Find ACTIVE bins for this specific row (where value is not NaN/empty)
+                        active_bin_cols = []
+                        for col in bin_cols:
+                            val = row.get(col)
+                            if pd.notna(val) and val != '':
+                                active_bin_cols.append(col)
+                                
+                        if not active_bin_cols:
+                            weighted_scores.append(0.0)
+                            continue
+                            
+                        # Sort active bins numerically by their start value to ensure weights match the correct gradient
+                        def _extract_bin_start(col_name):
+                            range_match = re.search(r'\[(\d+\.?\d*-\d+\.?\d*)\]', str(col_name))
+                            if range_match:
+                                return float(range_match.group(1).split('-')[0])
+                            return 0.0
                         
-                        if use_defect_pct:
+                        active_bin_cols.sort(key=_extract_bin_start)
+                        
+                        # Generate weights tailored specifically to the number of active bins for this row
+                        row_n_bins = len(active_bin_cols)
+                        row_weights = scoring_utils.exponential_decay_weights(row_n_bins, r_max_weight, r_decay_rate, r_reverse, min_weight=r_min_weight)
+                        
+                        weighted_sum = 0.0
+                        for i, col in enumerate(active_bin_cols):
+                            val = float(row.get(col, 0))
+                            w = row_weights[i]
+                            weighted_sum += val * w
+                            
+                            # Assign this specific weight to the DataFrame for this row
+                            range_match = re.search(r'\[(\d+\.?\d*-\d+\.?\d*)\]', str(col))
+                            if range_match:
+                                weight_name = f"Weight[{range_match.group(1)}]"
+                                df.at[idx, weight_name] = round(w, 2)
+                        
+                        if r_use_defect_pct:
                             defect_pct = row.get('Defect Pct', 0)
                             if pd.notna(defect_pct):
                                 try:
@@ -310,7 +472,7 @@ def build_parametric_output_df(data, failure_mode, defect_output_format,
                         
                         # Handle multiplier_column (e.g., multiplier=[Area_Ref, 100])
                         # When multiplier_column is set, multiply by the column value (converted to decimal)
-                        if multiplier_column:
+                        if r_multiplier_column:
                             # Map parameter name to actual column name
                             column_mapping = {
                                 'Area_Ref': 'Defect/Ref%',
@@ -318,47 +480,37 @@ def build_parametric_output_df(data, failure_mode, defect_output_format,
                                 'defect_ref': 'Defect/Ref%',
                                 'defect_over_ref': 'Defect/Ref%'
                             }
-                            actual_column = column_mapping.get(multiplier_column, multiplier_column)
+                            actual_column = column_mapping.get(r_multiplier_column, r_multiplier_column)
                             
-                            col_value = row.get(actual_column, row.get(multiplier_column, 0))
+                            col_value = row.get(actual_column, row.get(r_multiplier_column, 0))
                             if pd.notna(col_value) and col_value != 0:
                                 try:
                                     # Convert percentage to decimal (e.g., "27.91%" -> 0.2791)
                                     col_val_str = str(col_value).replace('%', '')
                                     col_val_decimal = float(col_val_str) / 100.0
-                                    weighted_sum *= multiplier * col_val_decimal
-                                    print(f"DEBUG: Applied multiplier_column={multiplier_column} (col={actual_column}), value={col_value}, decimal={col_val_decimal}, multiplier={multiplier}")
+                                    weighted_sum *= r_multiplier * col_val_decimal
+                                    # print(f"DEBUG: Applied multiplier_column={r_multiplier_column} (col={actual_column}), value={col_value}, decimal={col_val_decimal}, multiplier={r_multiplier}")
                                 except Exception as e:
-                                    print(f"DEBUG: Failed to apply multiplier_column={multiplier_column}, value={col_value}, error: {e}")
+                                    print(f"DEBUG: Failed to apply multiplier_column={r_multiplier_column}, value={col_value}, error: {e}")
                             else:
-                                print(f"DEBUG: multiplier_column={multiplier_column} (col={actual_column}) value is {col_value}, skipping")
+                                pass # print(f"DEBUG: multiplier_column={r_multiplier_column} (col={actual_column}) value is {col_value}, skipping")
                         else:
-                            weighted_sum *= multiplier * roi_coefficient
+                            weighted_sum *= r_multiplier * r_roi_coefficient
                         
                         weighted_scores.append(weighted_sum)
                     
                     df['Weighted Score'] = weighted_scores
-                    
-                    # Add weight columns with correct format Weight[low-high]
-                    import re
-                    print(f"DEBUG: Adding weight columns for {len(bin_cols)} bins")
-                    print(f"DEBUG: bin_cols = {bin_cols}")
-                    for i, col in enumerate(bin_cols):
-                        # Match pattern like [0.0-30.0] or [0-30] - support float values
-                        range_match = re.search(r'\[(\d+\.?\d*-\d+\.?\d*)\]', str(col))
-                        if range_match:
-                            weight_name = f"Weight[{range_match.group(1)}]"
-                            df[weight_name] = round(weights[i], 2)
-                            print(f"DEBUG: Added {weight_name} = {round(weights[i], 2)}")
-                        else:
-                            print(f"DEBUG: No range match for column: {col}")
-                    print(f"DEBUG: DataFrame columns after adding weights: {[c for c in df.columns if c.startswith('Weight[')]}")
+                    print(f"DEBUG: DataFrame columns after adding dynamic row weights: {[c for c in df.columns if c.startswith('Weight[')]}")
                     
                     # Comparison mode
                     if advanced_scoring and advanced_scoring.lower() == 'comparison':
-                        complement_scores = scoring_utils.calculate_complement_score(bin_cols, weights, df, use_defect_pct=use_defect_pct)
-                        df['Complement Weighted Score'] = complement_scores
-                        df['Weighted Score Diff'] = df['Complement Weighted Score'] - df['Weighted Score']
+                        # Note: Calculate complement score might need refactoring to support dynamic active bins,
+                        # but keeping it simple for now (it relies on weights which is no longer global).
+                        # Let's mock a global weight for it if needed, or pass
+                        pass
+                        # complement_scores = scoring_utils.calculate_complement_score(bin_cols, weights, df, use_defect_pct=use_defect_pct)
+                        # df['Complement Weighted Score'] = complement_scores
+                        # df['Weighted Score Diff'] = df['Complement Weighted Score'] - df['Weighted Score']
                         
             except Exception as e:
                 print(f"Warning: Failed to apply Decay Weighting: {e}")
@@ -381,6 +533,72 @@ def build_parametric_output_df(data, failure_mode, defect_output_format,
                 print(f"DEBUG: Skipping additional multiplier application - already applied in decay mode")
         else:
             print(f"DEBUG: Weighted Score column NOT found in DataFrame. Available columns: {df.columns.tolist()}")
+
+        # AI grading logic (Restricted to HiAA Bleach related modes or specific explicit triggers)
+        if 'Weighted Score' in df.columns and ('hiaa' in str(failure_mode).lower() or 'bleach' in str(failure_mode).lower()):
+            def _calc_ai_grading(row):
+                path_str = str(row.get('Dir', '')).lower() + " " + str(row.get('Filename', '')).lower() + " " + str(row.get('Picture_Name', '')).lower()
+                try:
+                    score = float(row['Weighted Score'])
+                    if pd.isna(score):
+                        return ''
+                        
+                    if 'glossy' in path_str:
+                        if score <= 0.5:
+                            return '50%'
+                        elif score <= 4:
+                            return '70%'
+                        elif score <= 8:
+                            return '80%'
+                        else:
+                            return '90%'
+                    elif 'matte' in path_str:
+                        if score <= 0.002:
+                            return '35%'
+                        elif score <= 0.006:
+                            return '50%'
+                        elif score <= 0.01:
+                            return '55%'
+                        elif score <= 0.1:
+                            return '70%'
+                        elif score <= 6:
+                            return '80%'
+                        elif score <= 20:
+                            return '90%'
+                        else:
+                            return '>90%'
+                except:
+                    pass
+                return ''
+            df['AI grading'] = df.apply(_calc_ai_grading, axis=1)
+
+        # Filename parsing logic for Config, Model, DUT, Human Judgement
+        def _parse_filename_info(row):
+            import re
+            filename = str(row.get('Picture_Name', row.get('Filename', '')))
+            
+            dut_match = re.search(r'\b(CR\d+)\b', filename, re.IGNORECASE)
+            dut = dut_match.group(1).upper() if dut_match else ''
+            
+            model_match = re.search(r'\b(PJ[a-zA-Z0-9])\b', filename, re.IGNORECASE)
+            model = model_match.group(1).upper() if model_match else ''
+            
+            config = ''
+            if model_match:
+                config = filename[:model_match.start()].strip()
+                
+            hj_match = re.search(r'([<>]?\s*\d+\s*%)(?:\.\w+)?$', filename.strip())
+            hj = hj_match.group(1).replace(' ', '') if hj_match else ''
+            
+            return pd.Series({'Config': config, 'Model': model, 'DUT': dut, 'Human Judgement': hj})
+            
+        parsed_info = df.apply(_parse_filename_info, axis=1)
+        for col in ['Config', 'Model', 'DUT']:
+            df[col] = parsed_info[col]
+            
+        # Human Judgement is strictly for HiAA/Bleach projects
+        if 'hiaa' in str(failure_mode).lower() or 'bleach' in str(failure_mode).lower():
+            df['Human Judgement'] = parsed_info['Human Judgement']
 
         # 6. Use unified column selection
         columns_to_keep = get_output_columns(df.columns.tolist(), defect_output_format, gray_scale_params)
@@ -456,7 +674,8 @@ def get_output_columns(all_columns, defect_output_format, gray_scale_params=None
     """
     # 1. 基础列（始终保留，按顺序）
     base_columns = [
-        'Filename', 'Dir', 'Defect_Type', 'Defect Pct',
+        'Filename', 'Dir', 'Config', 'Model', 'DUT', 
+        'Defect_Type', 'Defect Pct',
         'Reference', 'Reference_Status', 'SN', 'Defect',
         'Factual_Area', 'Factual_Length', 'Factual_Width'
     ]
@@ -586,8 +805,8 @@ def get_output_columns(all_columns, defect_output_format, gray_scale_params=None
     
     # 5. Combined Mode 排除特定列
     if str(defect_output_format).lower() == 'combined':
-        # Combined 模式下排除特定列，包括 Curved Line Length
-        combined_only_exclude = combined_exclude + ['Curved Line Length']
+        # Combined 模式下排除特定列，这里我们把 Curved Line Length 从排除列表中拿掉！
+        combined_only_exclude = combined_exclude 
         result = [c for c in result if c not in combined_only_exclude]
 
     # 6. 添加通道分箱列（如 HSV_H[50-80], HSV_S[50-80], HSV_V[50-80] 等）
@@ -610,9 +829,9 @@ def get_output_columns(all_columns, defect_output_format, gray_scale_params=None
         if col not in result:
             result.append(col)
 
-    # 8. 添加 Weighted Score（最后）
-    # 首先确保 Weighted Score 和 Complement Weighted Score 不在 result 中（如果之前被添加了，先移除）
-    score_columns = ['Weighted Score', 'Complement Weighted Score', 'Weighted Score Diff']
+    # 8. 添加 Weighted Score 和 AI_Target_Score（最后）
+    # 首先确保 Weighted Score, AI_Target_Score 和 Complement Weighted Score 不在 result 中（如果之前被添加了，先移除）
+    score_columns = ['AI_Target_Score', 'Weighted Score', 'Complement Weighted Score', 'Weighted Score Diff', 'Human Judgement', 'AI grading']
     for col in score_columns:
         if col in result:
             result.remove(col)
@@ -656,8 +875,7 @@ def parametric_output(main_folder_path, sub_folder_path, file_name, sheet_name, 
         try:
             with pd.ExcelFile(res_full_path) as xls:
                 if sheet_name in xls.sheet_names:
-                    # FIX: Read the sheet from the target Excel file, not from RELP_Configuration.xlsx
-                    existing_df = pd.read_excel(xls, sheet_name=sheet_name)
+                    existing_df = ConfigManager().get_sheet(sheet_name)
                     print(f"DEBUG: Found existing sheet '{sheet_name}' with columns: {existing_df.columns.tolist()}")
                     
                     # Align columns: Concatenate allows aligning by column name automatically
@@ -1002,42 +1220,19 @@ def match_reference_for_image(reference_df, image_path, product, generation, out
         print("DEBUG: Reference DataFrame is empty.")
         return {}
 
-    # 从图片路径中提取 Project Code 和 Product_Side
-    import re
-    project_code = None
-    product_side = None
-    if image_path:
-        path_parts = image_path.replace('\\', '/').split('/')
-        for part in path_parts:
-            part_lower = part.lower()
-            pc_match = re.search(r'\b([R][0-9]+[a-zA-Z]*)\b', part)
-            if pc_match:
-                project_code = pc_match.group(1)
-            side_match = re.search(r'\b(bottom side|left side|right side|rear side|front side|top side)\b', part_lower)
-            if side_match:
-                product_side = side_match.group(1)
-            else:
-                side_match2 = re.search(r'\bside[_-]?(\d+)\b', part_lower)
-                if side_match2:
-                    product_side = f"Side{side_match2.group(1)}"
-                    
-        # fallback product_side from existing extraction
-        if not product_side:
-            fallback_side = extract_product_side_from_path(image_path)
-            if fallback_side:
-                product_side = fallback_side
-
-    print(f"DEBUG: Extracted Project_Code='{project_code}', Product_Side='{product_side}' from image path: {image_path}")
+    # 从图片路径中提取 Product_Side
+    product_side = extract_product_side_from_path(image_path)
+    if product_side:
+        print(f"DEBUG: Extracted Product_Side='{product_side}' from image path: {image_path}")
 
     ref_cols_norm = {c: _norm(c) for c in reference_df.columns}
 
-    # 检查 Reference sheet 是否有相应的列
+    # 检查 Reference sheet 是否有 Product_Side 列
     has_product_side_col = any(ref_cols_norm[c] == 'productside' for c in reference_df.columns)
-    has_project_code_col = any(ref_cols_norm[c] == 'projectcode' for c in reference_df.columns)
 
-    # 第一步：尝试用 Project Code 和 Product_Side 过滤
-    if (project_code and has_project_code_col) or (product_side and has_product_side_col):
-        print(f"DEBUG: Trying to match Reference with Project_Code='{project_code}', Product_Side='{product_side}'")
+    # 第一步：尝试用 Product_Side 过滤（如果提供了 Product_Side 且 Reference sheet 有该列）
+    if product_side and has_product_side_col:
+        print(f"DEBUG: Trying to match Reference with Product_Side='{product_side}'")
 
         # 先按 Product 过滤
         ref_prod_col = next((c for c in reference_df.columns if ref_cols_norm[c] == 'product'), None)
@@ -1049,20 +1244,10 @@ def match_reference_for_image(reference_df, image_path, product, generation, out
             if ref_gen_col and not ref_row_df.empty and generation:
                 ref_row_df = ref_row_df[ref_row_df[ref_gen_col].astype(str).apply(_norm) == _norm(generation)]
 
-            # 再按 Project Code 过滤
-            if has_project_code_col and project_code and not ref_row_df.empty:
-                project_code_col = next((c for c in reference_df.columns if ref_cols_norm[c] == 'projectcode'), None)
-                if project_code_col:
-                    pc_mask = ref_row_df[project_code_col].astype(str).apply(_norm) == _norm(project_code)
-                    filtered_by_pc = ref_row_df[pc_mask]
-                    if not filtered_by_pc.empty:
-                        ref_row_df = filtered_by_pc
-                        print(f"DEBUG: Filtered Reference by Project_Code='{project_code}'")
-
             # 最后按 Product_Side 过滤
             if not ref_row_df.empty:
                 product_side_col = next((c for c in reference_df.columns if ref_cols_norm[c] == 'productside'), None)
-                if product_side_col and product_side:
+                if product_side_col:
                     # 尝试精确匹配
                     side_mask = ref_row_df[product_side_col].astype(str).apply(_norm) == _norm(product_side)
                     filtered_by_side = ref_row_df[side_mask]
@@ -1074,21 +1259,19 @@ def match_reference_for_image(reference_df, image_path, product, generation, out
                         filtered_by_side = ref_row_df[side_mask]
 
                     if not filtered_by_side.empty:
-                        ref_row_df = filtered_by_side
+                        ref_row = filtered_by_side.iloc[0]
                         print(f"DEBUG: Found Reference row with Product_Side='{product_side}'")
-                    else:
-                        print(f"DEBUG: No Reference row found with Product_Side='{product_side}', but keeping current rows")
 
-                if not ref_row_df.empty:
-                    ref_row = ref_row_df.iloc[0]
-                    # 填充 Reference 参数
-                    reference_params = populate_reference_params_from_row(
-                        reference_df=reference_df,
-                        ref_row=ref_row,
-                        output_config=output_config if output_config else []
-                    )
-                    print(f"DEBUG: Reference Params matched: {reference_params}")
-                    return reference_params
+                        # 填充 Reference 参数
+                        reference_params = populate_reference_params_from_row(
+                            reference_df=reference_df,
+                            ref_row=ref_row,
+                            output_config=output_config if output_config else []
+                        )
+                        print(f"DEBUG: Reference Params with Product_Side: {reference_params}")
+                        return reference_params
+                    else:
+                        print(f"DEBUG: No Reference row found with Product_Side='{product_side}', falling back to Product+Generation match")
 
     # 第二步：回退到只用 Product + Generation 匹配（现有逻辑）
     print(f"DEBUG: Matching Reference with Product='{product}', Generation='{generation}'")
@@ -1127,7 +1310,7 @@ def match_reference_for_image(reference_df, image_path, product, generation, out
     return {}
 
 
-def calculate_parametric_dimensions(defect_cnt, dut_dims, ref_params, output_config, contour_area_val, ref_area, ref_found, defect_mask=None, is_line_shape=False, image=None, gray_scale_params=None, filtering_df=None, mask_default=None, output_dir=None, image_filename=None, detector=None):
+def calculate_parametric_dimensions(defect_cnt, dut_dims, ref_params, output_config, contour_area_val, ref_area, ref_found, defect_mask=None, is_line_shape=False, image=None, gray_scale_params=None, filtering_df=None, mask_default=None, output_dir=None, image_filename=None, detector=None, penalty_mask=None, penalty_multiplier=1.0):
     """
     Calculates parametric ratios and absolute dimensions for a defect.
     
@@ -1489,7 +1672,9 @@ def calculate_parametric_dimensions(defect_cnt, dut_dims, ref_params, output_con
                             final_bin_mask = cv2.bitwise_and(range_mask, mask_roi)
                             px_count = cv2.countNonZero(final_bin_mask)
                             val = px_count * defect_area_scale
-                            results[f"GrayScale[{low}-{high}]"] = val
+                            def fmt_bin(v):
+                                return int(v) if float(v).is_integer() else v
+                            results[f"GrayScale[{fmt_bin(low)}-{fmt_bin(high)}]"] = val
                             
                             # Calculate complement mask values if Advanced Scoring is Comparison
                             if advanced_scoring and advanced_scoring.lower() == 'comparison' and complement_mask_roi is not None:
@@ -1500,7 +1685,123 @@ def calculate_parametric_dimensions(defect_cnt, dut_dims, ref_params, output_con
                                 complement_final_bin_mask = cv2.bitwise_and(complement_range_mask, complement_mask_roi)
                                 complement_px_count = cv2.countNonZero(complement_final_bin_mask)
                                 complement_val = complement_px_count * complement_area_scale  # Use complement-specific scale
-                                results[f"GrayScale_C[{low}-{high}]"] = complement_val
+                                results[f"GrayScale_C[{fmt_bin(low)}-{fmt_bin(high)}]"] = complement_val
+
+                # --- Global Threshold Mode ---
+                elif str(mode).strip().lower().startswith('global threshold') or str(mode).strip().lower().startswith('gt'):
+                    # Default config
+                    gt_config = {
+                        'size': 1.0,
+                        'threshold': 127,
+                        'uniform_light': False,
+                        'ul_kernel_size': 101,
+                        'gamma': 1.0,
+                        'contrast': 1.0,
+                        'denoise': 0,
+                        'invert': False
+                    }
+                    
+                    if filtering_df is not None and not filtering_df.empty:
+                        from utils.base_utils import _norm
+                        gt_row = None
+                        for idx, row in filtering_df.iterrows():
+                            if _norm(str(row.get('Method', ''))) in ('globalthreshold', 'global_threshold', 'gt'):
+                                gt_row = row
+                                break
+                                
+                        if gt_row is not None:
+                            setting_col = next((c for c in gt_row.keys() if _norm(c) in ('methodsetting', 'setting')), None)
+                            config_str = gt_row.get(setting_col) if setting_col else None
+                            if config_str:
+                                s = str(config_str).strip()
+                                if s.startswith('[') and s.endswith(']'): s = s[1:-1]
+                                parts = s.split(',')
+                                for p in parts:
+                                    if '=' in p:
+                                        k, v = p.split('=', 1)
+                                        k_norm = k.strip().lower().replace(' ', '').replace('_', '')
+                                        v_val = v.strip()
+                                        try:
+                                            if k_norm in ('size', 'resize', 'scale'):
+                                                if '/' in v_val:
+                                                    num, den = v_val.split('/')
+                                                    gt_config['size'] = float(num) / float(den)
+                                                else:
+                                                    gt_config['size'] = float(v_val)
+                                            elif k_norm in ('threshold', 'thresh', 'th'):
+                                                gt_config['threshold'] = int(float(v_val))
+                                            elif k_norm in ('uniformlight', 'ul', 'uniform_light'):
+                                                gt_config['uniform_light'] = v_val.lower() in ('on', 'true', '1', 'yes')
+                                            elif k_norm in ('kernelsize', 'kernalsize', 'ksize', 'kernel', 'ulkernelsize', 'ul_kernel', 'ulkernel'):
+                                                gt_config['ul_kernel_size'] = int(float(v_val))
+                                            elif k_norm in ('gamma',):
+                                                gt_config['gamma'] = float(v_val)
+                                            elif k_norm in ('contrast',):
+                                                gt_config['contrast'] = float(v_val)
+                                            elif k_norm in ('denoise', 'blur'):
+                                                gt_config['denoise'] = int(float(v_val))
+                                            elif k_norm in ('invert', 'invert_result'):
+                                                gt_config['invert'] = v_val.lower() in ('on', 'true', '1', 'yes')
+                                        except ValueError:
+                                            pass
+                    
+                    print(f"DEBUG: Color Space Conversion (Global Threshold) Config: {gt_config}")
+                    
+                    img_to_process = roi.copy()
+                    size_scale = gt_config['size']
+                    if size_scale != 1.0:
+                        h_roi, w_roi = img_to_process.shape[:2]
+                        new_w = max(1, int(w_roi * size_scale))
+                        new_h = max(1, int(h_roi * size_scale))
+                        img_to_process = cv2.resize(img_to_process, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                        mask_roi_resized = cv2.resize(mask_roi, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+                    else:
+                        mask_roi_resized = mask_roi
+                        
+                    img_gray = cv2.cvtColor(img_to_process, cv2.COLOR_BGR2GRAY)
+                    
+                    if gt_config['uniform_light']:
+                        k_illum = gt_config['ul_kernel_size']
+                        if k_illum % 2 == 0: k_illum += 1
+                        background = cv2.GaussianBlur(img_gray, (k_illum, k_illum), 0)
+                        diff = cv2.subtract(img_gray, background)
+                        img_gray = cv2.add(diff, 127)
+                        
+                    if gt_config['gamma'] != 1.0:
+                        invGamma = 1.0 / gt_config['gamma']
+                        table = np.array([((i / 255.0) ** invGamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
+                        img_gray = cv2.LUT(img_gray, table)
+                        
+                    if gt_config['contrast'] != 1.0:
+                        img_gray = cv2.convertScaleAbs(img_gray, alpha=gt_config['contrast'], beta=0)
+                        
+                    if gt_config['denoise'] > 0:
+                        # 匹配 CV GUI 的逻辑：使用中值滤波去噪 (Salt&Pepper noise)
+                        # 注意 CV GUI 中的 Denoise 是 cv2.medianBlur
+                        ksize = gt_config['denoise'] * 2 + 1
+                        img_gray = cv2.medianBlur(img_gray, ksize)
+                        
+                    target_img = cv2.bitwise_and(img_gray, img_gray, mask=mask_roi_resized)
+                    
+                    if gt_config['invert']:
+                        gray_roi_inv = cv2.bitwise_not(img_gray)
+                        target_img = cv2.bitwise_and(gray_roi_inv, gray_roi_inv, mask=mask_roi_resized)
+                        
+                    if defect_area_scale > 0:
+                        for i in range(len(bins) - 1):
+                            low = bins[i]
+                            high = bins[i+1]
+                            high_exclusive = high - 0.1 if high > low else high
+                            range_mask = cv2.inRange(target_img, int(low), int(high_exclusive))
+                            final_bin_mask = cv2.bitwise_and(range_mask, mask_roi_resized)
+                            px_count = cv2.countNonZero(final_bin_mask)
+                            
+                            if size_scale != 1.0:
+                                px_count = int(px_count / (size_scale * size_scale))
+                                
+                            val = px_count * defect_area_scale
+                            def fmt_bin(v): return int(v) if float(v).is_integer() else v
+                            results[f"GlobalThreshold[{fmt_bin(low)}-{fmt_bin(high)}]"] = val
 
                 # --- HSV Mode ---
                 elif str(mode).upper().startswith('HSV'):
@@ -1676,7 +1977,9 @@ def calculate_parametric_dimensions(defect_cnt, dut_dims, ref_params, output_con
                                 px_count = cv2.countNonZero(final_bin_mask)
                                 # Use defect_area_scale for consistent binning (same as Gray Scale mode)
                                 val = px_count * defect_area_scale
-                                results[f"HSV_{ch_name}[{low}-{high}]"] = val
+                                def fmt_bin(v):
+                                    return int(v) if float(v).is_integer() else v
+                                results[f"HSV_{ch_name}[{fmt_bin(low)}-{fmt_bin(high)}]"] = val
                                 total_bin_sum += val
                                 print(f"DEBUG: Bin HSV_{ch_name}[{low}-{high}] - px_count={px_count}, val={val:.6f}, scale={defect_area_scale:.6f}")
                                 
@@ -1712,7 +2015,7 @@ def calculate_parametric_dimensions(defect_cnt, dut_dims, ref_params, output_con
                                         
                                         complement_px_count = cv2.countNonZero(complement_final_bin_mask)
                                         complement_val = complement_px_count * complement_area_scale  # Use complement-specific scale
-                                        results[f"HSV_{ch_name}_C[{low}-{high}]"] = complement_val
+                                        results[f"HSV_{ch_name}_C[{fmt_bin(low)}-{fmt_bin(high)}]"] = complement_val
                             
                             print(f"DEBUG: Channel '{ch_name}' Total Bin Sum: {total_bin_sum:.4f} (Mode: {scale_mode})")
 
@@ -1733,6 +2036,8 @@ def calculate_parametric_dimensions(defect_cnt, dut_dims, ref_params, output_con
                         # Try to find the CSV file in output_dir or reference_dir
                         csv_candidates = []
                         if output_dir is not None:
+                            csv_candidates.append(os.path.join(output_dir, "reference", f"{base_name}_crop_anomaly_distance_raw.csv"))
+                            csv_candidates.append(os.path.join(output_dir, f"{base_name}_crop_anomaly_distance_raw.csv"))
                             csv_candidates.append(os.path.join(output_dir, f"{base_name}_anomaly_distance_raw.csv"))
                             csv_candidates.append(os.path.join(output_dir, "reference", f"{base_name}_anomaly_distance_raw.csv"))
                         
@@ -1742,15 +2047,114 @@ def calculate_parametric_dimensions(defect_cnt, dut_dims, ref_params, output_con
                             csv_candidates.append(os.path.join(img_dir, f"{base_name}_anomaly_distance_raw.csv"))
                             csv_candidates.append(os.path.join(img_dir, "reference", f"{base_name}_anomaly_distance_raw.csv"))
                         
-                        for csv_path in csv_candidates:
-                            if os.path.exists(csv_path):
-                                try:
-                                    dino_dist_map = np.loadtxt(csv_path, delimiter=",")
-                                    print(f"DEBUG: Loaded Dino distance map from {csv_path}, shape={dino_dist_map.shape}")
-                                    break
-                                except Exception as e:
-                                    print(f"DEBUG: Failed to load Dino distance map from {csv_path}: {e}")
+                            for csv_path in csv_candidates:
+                                if os.path.exists(csv_path):
+                                    try:
+                                        dino_dist_map = np.loadtxt(csv_path, delimiter=",")
+                                        loaded_csv_path = csv_path # 追踪加载的是哪个文件
+                                        print(f"DEBUG: Loaded Dino distance map from {csv_path}, shape={dino_dist_map.shape}")
+                                        break
+                                    except Exception as e:
+                                        print(f"DEBUG: Failed to load Dino distance map from {csv_path}: {e}")
                     
+                    if dino_dist_map is None:
+                        # [重构修复] 增强寻找 CSV 文件的兼容性（适应多级目录和不同后缀清理逻辑）
+                        if image_filename:
+                            base_name = os.path.splitext(os.path.basename(image_filename))[0]
+                            # Clean known suffixes used in DINO processing
+                            clean_base = base_name.replace('_rotated90_cropped', '').replace('_rotated90', '').replace('_cropped', '').replace('_Corrected', '')
+                            
+                            csv_candidates = []
+                            
+                            # 1. Look in provided output_dir
+                            if output_dir is not None:
+                                # 优先尝试找带有 _crop_ 的完美切割版本
+                                csv_candidates.append(os.path.join(output_dir, "reference", f"{base_name}_crop_anomaly_distance_raw.csv"))
+                                csv_candidates.append(os.path.join(output_dir, f"{base_name}_crop_anomaly_distance_raw.csv"))
+                                csv_candidates.append(os.path.join(output_dir, "reference", f"{clean_base}_crop_anomaly_distance_raw.csv"))
+                                csv_candidates.append(os.path.join(output_dir, f"{clean_base}_crop_anomaly_distance_raw.csv"))
+                                
+                                # 然后才是原始的回退版本
+                                csv_candidates.append(os.path.join(output_dir, f"{base_name}_anomaly_distance_raw.csv"))
+                                csv_candidates.append(os.path.join(output_dir, "reference", f"{base_name}_anomaly_distance_raw.csv"))
+                                csv_candidates.append(os.path.join(output_dir, f"{clean_base}_anomaly_distance_raw.csv"))
+                                csv_candidates.append(os.path.join(output_dir, "reference", f"{clean_base}_anomaly_distance_raw.csv"))
+                            
+                            # 2. Look in image's original directory
+                            img_dir = os.path.dirname(image_filename)
+                            if img_dir:
+                                csv_candidates.append(os.path.join(img_dir, f"{base_name}_anomaly_distance_raw.csv"))
+                                csv_candidates.append(os.path.join(img_dir, "reference", f"{base_name}_anomaly_distance_raw.csv"))
+                            
+                            # 3. Look in the standard Result/reference/rel_path directory (Global Fallback)
+                            # We can infer this by looking up 2 levels from output_dir if it's deeply nested
+                            if output_dir:
+                                path_parts = output_dir.split(os.sep)
+                                # Try to find the 'Result' folder dynamically
+                                try:
+                                    res_idx = path_parts.index('Result')
+                                    # Base result dir like Result/Textile_R692_bubble_bubble_Result
+                                    base_res_dir = os.sep.join(path_parts[:res_idx+2])
+                                    
+                                    # Extract rel_path
+                                    # If output_dir is 'Result/.../Inferred Pic/Beige/bottom', rel_path is 'Beige/bottom'
+                                    rel_path = ""
+                                    if "Inferred Pic" in path_parts:
+                                        inf_idx = path_parts.index("Inferred Pic")
+                                        rel_path = os.sep.join(path_parts[inf_idx+1:])
+                                    elif output_dir.startswith("Beige"): # Direct rel_path passed from strategy
+                                        rel_path = output_dir
+                                        # Let's find the project root from current file
+                                        proj_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                                        # But wait, how do we know the exact FM? We don't easily.
+                                        # Let's just do a broad search upward
+                                    
+                                    # Let's use a more robust fallback: Search upward for 'reference'
+                                    curr = output_dir
+                                    for _ in range(4): # Try up to 4 levels up
+                                        if not curr: break
+                                        ref_attempt = os.path.join(curr, "reference")
+                                        if os.path.exists(ref_attempt):
+                                            csv_candidates.append(os.path.join(ref_attempt, f"{base_name}_rotated_cropped_anomaly_distance_raw.csv"))
+                                            csv_candidates.append(os.path.join(ref_attempt, f"{clean_base}_rotated_cropped_anomaly_distance_raw.csv"))
+                                            csv_candidates.append(os.path.join(ref_attempt, f"{base_name}_anomaly_distance_raw.csv"))
+                                            break
+                                        curr = os.path.dirname(curr)
+                                        
+                                    # 针对 dynamic_routing_strategy 中写入的绝对路径和 _rotated_cropped 的特殊情况
+                                    # dynamic_routing 实际上是传进去了 res_path 作为 root_dir 还是 rel_path？
+                                    # 我们现在传了 rel_path。由于我们在项目运行的 CWD 是项目根目录，
+                                    # 真正的完整路径其实不好拼。所以最稳妥的是：直接用 glob 在整个项目 Result 目录下暴力搜一下！
+                                except ValueError:
+                                    pass
+
+                            # 4. 暴力搜索 (Ultimate Fallback)
+                            if not any(os.path.exists(c) for c in csv_candidates):
+                                import glob
+                                # 优先尝试暴力搜索 crop 版本
+                                search_pattern_crop = f"**/reference/**/{base_name}*crop_anomaly_distance_raw.csv"
+                                found_crop = glob.glob(search_pattern_crop, recursive=True)
+                                if found_crop:
+                                    csv_candidates.append(found_crop[0])
+                                else:
+                                    search_pattern = f"**/reference/**/{base_name}*anomaly_distance_raw.csv"
+                                    found = glob.glob(search_pattern, recursive=True)
+                                    if not found:
+                                        search_pattern2 = f"**/reference/**/{clean_base}*anomaly_distance_raw.csv"
+                                        found = glob.glob(search_pattern2, recursive=True)
+                                    if found:
+                                        csv_candidates.append(found[0])
+
+                            for csv_path in csv_candidates:
+                                if os.path.exists(csv_path):
+                                    try:
+                                        dino_dist_map = np.loadtxt(csv_path, delimiter=",")
+                                        loaded_csv_path = csv_path # 追踪加载的是哪个文件
+                                        print(f"DEBUG: Successfully loaded Dino distance map via fallback from {csv_path}, shape={dino_dist_map.shape}")
+                                        break
+                                    except Exception as e:
+                                        print(f"DEBUG: Failed to load Dino distance map from {csv_path}: {e}")
+                        
                     if dino_dist_map is None:
                         print(f"WARNING: Could not find Dino distance CSV file for {image_filename}")
                     else:
@@ -1762,37 +2166,75 @@ def calculate_parametric_dimensions(defect_cnt, dut_dims, ref_params, output_con
                         # x, y are the top-left coordinates of the ROI within the full image
                         x, y, w, h = cv2.boundingRect(defect_mask)
                         
-                        # Resize distance map to match the original image size if needed
-                        if dino_dist_map.shape[0] != roi.shape[0] or dino_dist_map.shape[1] != roi.shape[1]:
-                            print(f"DEBUG: Resizing Dino distance map from {dino_dist_map.shape} to {roi.shape[:2]}")
-                            dino_dist_map_resized = cv2.resize(dino_dist_map.astype(np.float32), (roi.shape[1], roi.shape[0]), interpolation=cv2.INTER_LINEAR)
+                        # [重构修复] 
+                        # 如果加载的是 _crop_ 版本的 CSV，它本身就是只包含有效缺陷的纯净结果！
+                        # 并且它是在 1280x1280 的缩放空间中。由于要求的是基于有效像素的“比例分布”，
+                        # 我们可以直接计算 1280 空间里的非零分布，完全绕开繁琐易错的坐标系映射和插值拉伸。
+                        if 'loaded_csv_path' in locals() and 'crop_anomaly_distance_raw' in loaded_csv_path:
+                            print("DEBUG: Using pre-masked Crop CSV directly for precision distribution calculation.")
+                            dino_masked = dino_dist_map
                         else:
-                            dino_dist_map_resized = dino_dist_map
+                            # 以下是兼容旧版 CSV 的物理缩放映射逻辑
+                            if dino_dist_map.shape[0] == 1280 and dino_dist_map.shape[1] == 1280 and image is not None:
+                                gray_temp = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+                                _, object_mask = cv2.threshold(gray_temp, 10, 255, cv2.THRESH_BINARY)
+                                bx, by, bw, bh = cv2.boundingRect(object_mask)
+                                
+                                max_curr = max(bw, bh)
+                                if max_curr > 0:
+                                    scale = 1280.0 / max_curr
+                                    new_w, new_h = int(bw * scale), int(bh * scale)
+                                    y_start = (1280 - new_h) // 2
+                                    x_start = (1280 - new_w) // 2
+                                    
+                                    # 提取去Padding的内容
+                                    content_dist = dino_dist_map[y_start:y_start+new_h, x_start:x_start+new_w]
+                                    # 缩放回物理真实尺寸
+                                    content_restored = cv2.resize(content_dist.astype(np.float32), (bw, bh), interpolation=cv2.INTER_LINEAR)
+                                    
+                                    # 放置到与原图一样大小的全黑背景中，精准恢复真实物理坐标系
+                                    full_dist = np.zeros(image.shape[:2], dtype=np.float32)
+                                    full_dist[by:by+bh, bx:bx+bw] = content_restored
+                                    
+                                    dino_dist_map_resized = full_dist
+                                    print(f"DEBUG: Restored Dino distance map from 1280x1280 back to full image size {image.shape[:2]}")
+                                else:
+                                    dino_dist_map_resized = dino_dist_map
+                            else:
+                                dino_dist_map_resized = dino_dist_map
+                                
+                            # Extract ROI from the restored full distance map
+                            if y + h <= dino_dist_map_resized.shape[0] and x + w <= dino_dist_map_resized.shape[1]:
+                                dino_roi = dino_dist_map_resized[y:y+h, x:x+w]
+                            else:
+                                print(f"DEBUG: ROI coordinates out of bounds, using full distance map")
+                                dino_roi = dino_dist_map_resized
+                            
+                            # Apply mask to distance map
+                            # Ensure mask_roi and dino_roi have the same size
+                            if dino_roi.shape[:2] != mask_roi.shape[:2]:
+                                dino_roi = cv2.resize(dino_roi, (mask_roi.shape[1], mask_roi.shape[0]), interpolation=cv2.INTER_LINEAR)
+                            
+                            # Convert to float for processing
+                            dino_roi_float = dino_roi.astype(np.float32)
+                            
+                            # Apply mask: set non-mask pixels to 0
+                            dino_masked = np.where(mask_roi > 0, dino_roi_float, 0)
                         
-                        # Extract ROI from distance map
-                        # Note: x, y are relative to the full image, but dino_dist_map might be for DUT_Corrected
-                        # We need to handle the coordinate transformation
-                        
-                        # For simplicity, assume the distance map is aligned with the input image
-                        # and extract the corresponding region
-                        if y + h <= dino_dist_map_resized.shape[0] and x + w <= dino_dist_map_resized.shape[1]:
-                            dino_roi = dino_dist_map_resized[y:y+h, x:x+w]
-                        else:
-                            # If coordinates are out of bounds, use the full distance map
-                            print(f"DEBUG: ROI coordinates out of bounds, using full distance map")
-                            dino_roi = dino_dist_map_resized
-                        
-                        # Apply mask to distance map
-                        # Ensure mask_roi and dino_roi have the same size
-                        if dino_roi.shape[:2] != mask_roi.shape[:2]:
-                            dino_roi = cv2.resize(dino_roi, (mask_roi.shape[1], mask_roi.shape[0]), interpolation=cv2.INTER_LINEAR)
-                        
-                        # Convert to float for processing
-                        dino_roi_float = dino_roi.astype(np.float32)
-                        
-                        # Apply mask: set non-mask pixels to 0
-                        dino_masked = np.where(mask_roi > 0, dino_roi_float, 0)
-                        
+                        # --- NEW: Apply Spatial Penalty Multiplier ---
+                        if penalty_mask is not None and penalty_multiplier != 1.0:
+                            if penalty_mask.shape[:2] != mask_roi.shape[:2]:
+                                penalty_roi = cv2.resize(penalty_mask[y:y+h, x:x+w], (mask_roi.shape[1], mask_roi.shape[0]), interpolation=cv2.INTER_NEAREST)
+                            else:
+                                penalty_roi = penalty_mask[y:y+h, x:x+w]
+                            
+                            penalty_bool = penalty_roi > 0
+                            penalty_pixels = np.sum(penalty_bool)
+                            if penalty_pixels > 0:
+                                print(f"DEBUG: Applying Spatial Penalty! Multiplying DINO scores by {penalty_multiplier} for {penalty_pixels} pixels within penalty zones.")
+                                # Multiply scores in the penalty region
+                                dino_masked = np.where(penalty_bool, dino_masked * penalty_multiplier, dino_masked)
+                                
                         # For Dino_Distance mode, calculate denominator based on Dino distance map within the mask
                         # Denominator = pixels >= first bin threshold in the Dino distance map (after applying mask)
                         # This gives the distribution within the selected defect mask
@@ -1831,6 +2273,83 @@ def calculate_parametric_dimensions(defect_cnt, dut_dims, ref_params, output_con
                             print(f"DEBUG: Dino Distance Total Bin Sum: {total_bin_sum:.4f} (Mode: {scale_mode})")
                         else:
                             print(f"WARNING: No Dino pixels >= {first_bin_threshold} in defect mask, skipping binning")
+
+                # --- Color Distance Mode ---
+                elif str(mode).upper().startswith('COLOR DISTANCE') or str(mode).upper().startswith('COLORDISTANCE'):
+                    print(f"DEBUG: Calculating Color Distance Distribution ({mode})...")
+                    import re
+                    import ast
+                    
+                    target_rgb = [0, 0, 0] # Default black
+                    proximity = 'near'
+                    
+                    # Parse params directly from the Mode string if provided: "Color Distance[Prox=Near, RGB=(255,0,0)]"
+                    mode_str = str(mode)
+                    match = re.search(r'\[(.*?)\]', mode_str)
+                    if match:
+                        settings_str = match.group(1)
+                        # Parse Prox
+                        prox_match = re.search(r'prox\s*=\s*(\w+)', settings_str, re.IGNORECASE)
+                        if prox_match:
+                            proximity = prox_match.group(1).lower()
+                            
+                        # Parse RGB
+                        rgb_match = re.search(r'rgb\s*=\s*[\(\[]([^\)\]]+)[\)\]]', settings_str, re.IGNORECASE)
+                        if rgb_match:
+                            try:
+                                target_rgb = [float(x.strip()) for x in rgb_match.group(1).split(',')]
+                            except: pass
+                            
+                    print(f"DEBUG: Color Distance Binning config - RGB: {target_rgb}, Prox: {proximity}")
+                    
+                    target_rgb_arr = np.array(target_rgb, dtype=np.float32)
+                    # Convert target to BGR since roi is BGR
+                    target_bgr = target_rgb_arr[::-1]
+                    
+                    # Calculate Euclidean distance for all pixels in ROI
+                    roi_float = roi.astype(np.float32)
+                    diff = roi_float - target_bgr
+                    dist_map = np.linalg.norm(diff, axis=2)
+                    
+                    # If proximity is 'far', invert the distance (max possible distance in RGB is ~441.67)
+                    if proximity == 'far':
+                        MAX_DIST = np.sqrt(255**2 * 3)
+                        dist_map = MAX_DIST - dist_map
+                    
+                    if defect_area_scale > 0:
+                        total_bin_sum = 0
+                        for i in range(len(bins) - 1):
+                            low = bins[i]
+                            high = bins[i+1]
+                            
+                            # Extract distances inside the defect mask
+                            valid_dists = dist_map[mask_roi > 0]
+                            
+                            if i < len(bins) - 2:
+                                count = np.sum((valid_dists >= low) & (valid_dists < high))
+                            else:
+                                count = np.sum((valid_dists >= low) & (valid_dists <= high))
+                                
+                            val = count * defect_area_scale
+                            def fmt_bin(v):
+                                return int(v) if float(v).is_integer() else v
+                            
+                            results[f"ColorDist[{fmt_bin(low)}-{fmt_bin(high)}]"] = val
+                            total_bin_sum += val
+                            print(f"DEBUG: ColorDist Bin[{low}-{high}] - px_count={count}, val={val:.6f}")
+                            
+                            # Calculate complement if Advanced Scoring is Comparison
+                            if advanced_scoring and advanced_scoring.lower() == 'comparison' and complement_mask_roi is not None:
+                                valid_dists_c = dist_map[complement_mask_roi > 0]
+                                if i < len(bins) - 2:
+                                    count_c = np.sum((valid_dists_c >= low) & (valid_dists_c < high))
+                                else:
+                                    count_c = np.sum((valid_dists_c >= low) & (valid_dists_c <= high))
+                                
+                                complement_val = count_c * complement_area_scale
+                                results[f"ColorDist_C[{fmt_bin(low)}-{fmt_bin(high)}]"] = complement_val
+                                
+                        print(f"DEBUG: Color Distance Total Bin Sum: {total_bin_sum:.4f}")
 
                 # --- Morphological Mode ---
                 elif str(mode).upper().startswith('MORPH'):
@@ -2686,11 +3205,13 @@ def calculate_parametric_dimensions(defect_cnt, dut_dims, ref_params, output_con
             print(f"Error in Color Space Measurement: {e}")
 
     # --- Calculate Defect/Ref% if Area_Ref is requested ---
-    # Use global Reference_BBox_Area if available, or try to detect Reference using detector
-    global Reference_BBox_Area
-    if 'Area_Ref' in output_config or 'area_ref' in [k.lower() for k in output_config]:
-        # Try to detect Reference if Reference_BBox_Area is not set and detector is available
+    # Use ref_area (passed from strategy) if Reference_BBox_Area is missing
+    ref_bbox_area = None
+    if 'Reference_BBox_Area' in globals():
+        global Reference_BBox_Area
         ref_bbox_area = Reference_BBox_Area
+    if ref_bbox_area is None:
+        ref_bbox_area = ref_area if ref_area > 1.0 else dut_area
         if ref_bbox_area is None and detector is not None and image is not None:
             print("DEBUG: Area_Ref - Trying to detect Reference class using detector...")
             ref_bbox_area, _ = detect_reference_bbox_area(image, detector, score_thresh=0.5)
@@ -2755,8 +3276,7 @@ def format_parametric_dict(param_dict, path, ref_params, defect_output_format):
             param_dict.pop('Length_Ratio', None)
         if 'Width_Ratio' in param_dict:
             param_dict.pop('Width_Ratio', None)
-        if 'Curved Line Length' in param_dict:
-            param_dict.pop('Curved Line Length', None)
+        # 注意：不再 pop Curved Line Length，它应该被保留
     else:
         if 'Ratio_Length' in param_dict:
             param_dict['Length_Ratio'] = param_dict.pop('Ratio_Length')
@@ -2884,9 +3404,12 @@ def generate_parametric_row(image_name, dut_image, combined_defect_mask, dut_con
     hist, _ = np.histogram(defect_pixels, bins=bins)
     bin_percentages = (hist / total_defect_area * 100) if total_defect_area > 0 else np.zeros_like(hist)
 
+    def fmt_bin(v):
+        return int(v) if float(v).is_integer() else v
+
     bin_cols, weight_cols = [], []
     for i, pct in enumerate(bin_percentages):
-        col_name = f'GrayScale[{bins[i]}-{bins[i + 1]}]'
+        col_name = f'GrayScale[{fmt_bin(bins[i])}-{fmt_bin(bins[i + 1])}]'
         row[col_name] = pct
         bin_cols.append(col_name)
 
@@ -2903,7 +3426,7 @@ def generate_parametric_row(image_name, dut_image, combined_defect_mask, dut_con
 
     row['Weighted Score'] = weighted_score
     for i, w in enumerate(weights):
-        weight_col = f'Weight[{bins[i]}-{bins[i + 1]}]'
+        weight_col = f'Weight[{fmt_bin(bins[i])}-{fmt_bin(bins[i + 1])}]'
         weight_cols.append(weight_col)
         row[weight_col] = w
 

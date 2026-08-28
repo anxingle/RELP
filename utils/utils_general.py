@@ -287,7 +287,7 @@ class SAM2OnnxPredictor:
             
         return np.array(final_masks), scores[0], None
 
-def old_init_sam2(config_path, checkpoint_path, device='mps'):
+def old_init_sam2(config_path, checkpoint_path, device='cpu'):
     global sam2_model
     try:
         if not checkpoint_path or not os.path.exists(checkpoint_path):
@@ -535,19 +535,41 @@ Updated: NOV 7,2025
 
 
 
-def perform_general_defect_detection(image, predictor, output_path, save_visualization=False):
-    """
-    Runs Detectron2 inference on the image using the provided predictor.
-    Draws BBOXes and class names on the image and saves it if save_visualization is True.
-    Returns the predicted boxes (tensor or numpy array).
-    """
-    from detectron2.utils.visualizer import Visualizer, ColorMode
-    
+def perform_general_defect_detection(image, predictor, output_path, save_visualization=False, prompt=None):
     if image is None or predictor is None:
         return None
 
+    # Handle Grounding DINO predictor
+    if hasattr(predictor, "predict") and type(predictor).__name__ == "GroundingDinoPredictor":
+        if prompt is None:
+            # We try to use the predictor's stored prompt if the caller didn't pass one.
+            if hasattr(predictor, "default_prompt") and predictor.default_prompt:
+                prompt = predictor.default_prompt
+            else:
+                print("Warning: GroundingDino requires a prompt but none was given. Defaulting to 'defect.'")
+                prompt = "defect." 
+            
+        try:
+            results = predictor.predict(image, prompt)
+            
+            if save_visualization and output_path:
+                vis_img = image.copy()
+                for res in results:
+                    box = [int(v) for v in res['bbox']]
+                    cv2.rectangle(vis_img, (box[0], box[1]), (box[2], box[3]), (0, 255, 0), 2)
+                    cv2.putText(vis_img, f"{res['class_name']}:{res['score']:.2f}", 
+                              (box[0], max(0, box[1]-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+                cv2.imwrite(output_path, vis_img)
+                print(f"Saved Grounding DINO Detection result to: {output_path}")
+                
+            return results
+        except Exception as e:
+            print(f"Error in Grounding DINO Detection: {e}")
+            return []
+
+    # Handle standard Detectron2 predictor
+    from detectron2.utils.visualizer import Visualizer, ColorMode
     try:
-        # Run Inference
         outputs = predictor(image)
         instances = outputs["instances"].to("cpu")
         
@@ -1953,7 +1975,7 @@ def parse_filename_info(filename):
 
 
 
-def init_sam2(config_path, checkpoint_path, device='mps'):
+def init_sam2(config_path, checkpoint_path, device='cpu'):
     global sam2_model
     sam2_model = _real_init_sam2(config_path, checkpoint_path, device)
 
@@ -2018,6 +2040,11 @@ def extract_detections(sam2_predictor, image_rgb, boxes, tape_classes=None, mask
                 rect = cv2.minAreaRect(largest_contour)
                 angle = rect[-1]
                 if rect[1][0] < rect[1][1]:
+                    angle += 90
+                # 标准化角度到 (-45, 45] 区间，避免 90/180 度翻转
+                while angle > 45:
+                    angle -= 90
+                while angle <= -45:
                     angle += 90
             except:
                 angle = 0

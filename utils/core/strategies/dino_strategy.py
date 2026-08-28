@@ -17,7 +17,7 @@ class DinoStrategy(AnalysisStrategy):
     
     def _resolve_models(self, cfg_mgr):
         import torch
-        device_str = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+        device_str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
         self.device = torch.device(device_str)
         print(f">>> [DinoStrategy] Using device: {self.device}")
 
@@ -181,7 +181,7 @@ class DinoStrategy(AnalysisStrategy):
                 print(f">>> [Strategy] Reusing globally initialized SAM2 model")
             elif sam_ckpt:
                 import torch
-                device_str = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+                device_str = "cuda" if torch.cuda.is_available() else "cpu"
                 utils_general.init_sam2(sam_cfg, sam_ckpt, device=device_str)
                 sam2_model = utils_general.sam2_model
                 if hasattr(sam2_model, 'predict'):
@@ -195,25 +195,24 @@ class DinoStrategy(AnalysisStrategy):
 
         dino_weight_path = weights.get('dino') or weights.get('Dino') or weights.get('dinov3_weights')
         self.dino_model = None
-        self.upsampler = None
         if dino_weight_path:
             try:
                 print(f">>> [DinoStrategy] Loading Dino model from {dino_weight_path}")
                 self.dino_model = dinov3_utils.load_model(dino_weight_path, self.device)
             except Exception as e:
                 print(f">>> [DinoStrategy] Failed to load Dino model: {e}")
-                
+        
+        self.upsampler = None
         use_anyup = str(getattr(flow_cfg, 'upsampling', '')).strip().lower() in ('yes', 'true', '1') if flow_cfg else False
         if use_anyup:
              try:
                  print(f">>> [DinoStrategy] Loading AnyUp upsampler...")
                  self.upsampler = dinov3_utils.load_anyup_upsampler(self.device)
              except Exception as e:
-                 import traceback
-                 print(f">>> [DinoStrategy] Failed to load AnyUp upsampler: {e}")
-                 traceback.print_exc()
+                 print(f">>> [DinoStrategy] Failed to load AnyUp model: {e}")
                  
         return flow_cfg
+
 
     def execute(self) -> None:
         print(">>> [Strategy] Executing DinoStrategy (Modern Pipeline)...")
@@ -231,11 +230,18 @@ class DinoStrategy(AnalysisStrategy):
         
         base_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.dirname(os.path.dirname(os.path.dirname(base_dir)))
-        output_path_type = str(fm_row['Output_Path']) if fm_row is not None else 'Result'
-        if output_path_type == 'Result':
-            self.res_path = os.path.join(project_root, 'Result', f"{self.product}_{self.generation}_{fm}_{fm}_Result")
+        # Determine Output Result Path
+        if self.res_path:
+            # Respect injected res_path (from Dispatcher)
+            pass
         else:
-            self.res_path = os.path.join(output_path_type, f"{self.product}_{self.generation}_{fm}_{fm}_Result")
+            output_path_type = str(fm_row['Output_Path']).strip() if fm_row is not None and pd.notna(fm_row.get('Output_Path')) else 'Result'
+            if output_path_type.lower() == 'nan': output_path_type = 'Result'
+            
+            if output_path_type == 'Result':
+                self.res_path = os.path.join(project_root, 'Result', f"{self.product}_{self.generation}_{fm}_{fm}_Result")
+            else:
+                self.res_path = os.path.join(output_path_type, f"{self.product}_{self.generation}_{fm}_{fm}_Result")
             
         flow_cfg = self._resolve_models(cfg_mgr)
         if not flow_cfg: return
@@ -247,17 +253,38 @@ class DinoStrategy(AnalysisStrategy):
         if pca_val is None or str(pca_val).lower() == 'nan': pca_val = 'No'
         self.context['use_batch_alignment'] = str(pca_val).strip().lower() == 'yes'
         
-        utils_general.Output_Config = ['Length']
-        utils_general.Reference_Params = {'Length': {'R': 200.0}}
-        utils_general.Gray_Scale_Params = {'Enabled': True, 'Mode': 'Gray Scale', 'Invert': 'Yes', 'Bining': '[0, 50, 90, 120, 150, 180, 210, 255]'}
+        # 删除旧的祖传硬编码，让其回退到 base_strategy 解析到的 Excel 配置
+        # utils_general.Output_Config = ['Length']
+        # utils_general.Reference_Params = {'Length': {'R': 200.0}}
+        # utils_general.Gray_Scale_Params = {'Enabled': True, 'Mode': 'Gray Scale', 'Invert': 'Yes', 'Bining': '[0, 50, 90, 120, 150, 180, 210, 255]'}
         
+        # 准备动态读取 Reference
+        reference_df = cfg_mgr.get_sheet('Reference')
+        
+        # 解析 Upsampling Definition
+        upsampling_def = getattr(flow_cfg, 'upsampling_definition', None)
+        utils_general.Upsampling_Target_Size = 448 # Default fallback value
+        if upsampling_def and str(upsampling_def).strip().lower() != 'nan':
+            try:
+                custom_size = int(float(upsampling_def))
+                if getattr(self, 'device', None) and self.device.type == 'mps' and custom_size > 640:
+                    print(f">>> [DinoStrategy] DEBUG: MPS Device detected. Capping Upsampling Target Size from {custom_size} to 640.")
+                    custom_size = 640
+                utils_general.Upsampling_Target_Size = custom_size
+                print(f">>> [DinoStrategy] Global Upsampling Target Size set to: {utils_general.Upsampling_Target_Size} (from Excel)")
+            except Exception as e:
+                print(f">>> [DinoStrategy] Warning: Could not parse Upsampling Definition '{upsampling_def}': {e}")
+        else:
+            print(f">>> [DinoStrategy] No Upsampling Definition found in Excel. Using default: 448")
+
         scaling_df = cfg_mgr.get_sheet('Scaling')
         utils_general.DUT_Scaling_Config = {}
         utils_general.Feature_Scaling_Config = {}
         
         import utils.filtering_ops as fo
         excel_path = "RELP_Configuration.xlsx" 
-        filtering_df = fo.load_and_filter_filtering_sheet(excel_path, self.product, self.generation, fm, None, verbose=False)
+        cg_override = self.context.get('config_group_override')
+        filtering_df = fo.load_and_filter_filtering_sheet(excel_path, self.product, self.generation, fm, cg_override, verbose=False)
 
         adaptive_gaussian_df = cfg_mgr.get_sheet('Adaptive Gaussian')
         current_adaptive_gaussian_config = None
@@ -279,7 +306,7 @@ class DinoStrategy(AnalysisStrategy):
                     print(f">>> [DinoStrategy] Loaded Adaptive Gaussian config: {current_adaptive_gaussian_config}")
                 
         dino_th_df = cfg_mgr.get_sheet('Dino_TH')
-        current_dino_threshold = None
+        current_dino_threshold = 0.0  # 沿用 complex_textile_strategy 的处理方式，默认为 0.0
         flooding_enabled = False
         flooding_rgb = None
         if not dino_th_df.empty:
@@ -344,9 +371,57 @@ class DinoStrategy(AnalysisStrategy):
                 dino_input_dim = str(dino_input_dim_val)
         self.context['dino_input_dim'] = dino_input_dim
         
+        # 确定 Defect Output Format 和 Color Space 参数 (在循环外确定一次即可)
+        dof = 'individual'
+        calc_curved_line = False
+        if not self.defect_output_df.empty:
+            dof_row = self.defect_output_df[self.defect_output_df['Failure Mode'].astype(str).str.strip() == fm.strip()]
+            if not dof_row.empty:
+                dof = str(dof_row.iloc[0].get('Defect Output Format', 'individual')).strip().lower()
+                
+                # Check if Curved Line Measurement is requested
+                curved_val = str(dof_row.iloc[0].get('Curved Line Measurement', '')).strip().lower()
+                if curved_val in ('yes', 'true', '1'):
+                    calc_curved_line = True
+                
+                # 动态读取 Excel 里的 Color Space Conversion 和 Binning 参数
+                mode_val = dof_row.iloc[0].get('Color Space Conversion')
+                bin_val = dof_row.iloc[0].get('Color Space Binning')
+                if pd.notna(mode_val) and str(mode_val).strip() != '':
+                    utils_general.Gray_Scale_Params = {
+                        'Enabled': True,
+                        'Mode': str(mode_val).strip(),
+                        'Invert': str(dof_row.iloc[0].get('Color Space Invertion', 'No')).strip(),
+                        'Bining': str(bin_val).strip() if pd.notna(bin_val) else ''
+                    }
+                    print(f">>> [Strategy] Dynamically loaded Gray Scale Params: {utils_general.Gray_Scale_Params}")
+        
         for image_path in files_to_process:
             file = os.path.basename(image_path)
             print(f"\n>>> [Strategy] Processing {file}...")
+            
+            # --- 动态 Reference 匹配 ---
+            utils_general.Reference_Params.clear()
+            if reference_df is not None and not reference_df.empty:
+                try:
+                    from utils.output_ops import match_reference_for_image
+                    dynamic_ref = match_reference_for_image(
+                        reference_df, file, self.product, self.generation, getattr(utils_general, 'Output_Config', []), 'DUT'
+                    )
+                    if dynamic_ref: utils_general.Reference_Params.update(dynamic_ref)
+                except Exception as e:
+                    print(f">>> [Strategy] Warning: Failed to match dynamic reference: {e}")
+            
+            # --- Handle Relative Path ---
+            rel_path = os.path.relpath(os.path.dirname(image_path), download_path)
+            if rel_path == '.': rel_path = ''
+            
+            curr_inf_dir = os.path.join(inferred_pic_dir, rel_path)
+            curr_ref_dir = os.path.join(reference_dir, rel_path)
+            os.makedirs(curr_inf_dir, exist_ok=True)
+            if debug_mode: os.makedirs(curr_ref_dir, exist_ok=True)
+            
+            curr_res_dir = os.path.join(res_path, rel_path)
             
             # --- Handle Inherited Data ---
             inherited_data = self.context.get('inherited_data', {}).get(image_path)
@@ -356,9 +431,10 @@ class DinoStrategy(AnalysisStrategy):
             suffix = os.path.splitext(file)[1]
             if suffix.lower() == '.heic': suffix = '.jpg'
             if debug_mode:
-                path_to_process = os.path.join(reference_dir, f"{os.path.splitext(file)[0]}_rotated90_cropped{suffix}")
-            else:
-                path_to_process = os.path.join(res_path, f"temp_{os.path.splitext(file)[0]}{suffix}")
+                path_to_process = os.path.join(curr_ref_dir, f"{os.path.splitext(file)[0]}_rotated90_cropped{suffix}")
+            if not debug_mode:
+                os.makedirs(curr_res_dir, exist_ok=True)
+                path_to_process = os.path.join(curr_res_dir, f"temp_{os.path.splitext(file)[0]}{suffix}")
             
             if inherited_data:
                 print(f">>> [Strategy] Using inherited mask and image from previous stage.")
@@ -398,7 +474,7 @@ class DinoStrategy(AnalysisStrategy):
                     model=self.dino_model,
                     upsampler=self.upsampler,
                     device=self.device,
-                    save_dir=reference_dir if debug_mode else res_path, 
+                    save_dir=curr_ref_dir if debug_mode else curr_res_dir, 
                     super_resolution_factor=1.0,
                     contour_shrink_ratio=contour_shrink_ratio,
                     transparency_threshold=current_dino_threshold,
@@ -408,7 +484,7 @@ class DinoStrategy(AnalysisStrategy):
                     adaptive_gaussian_config=current_adaptive_gaussian_config,
                     dino_input_dim=dino_input_dim,
                     contour_image=Contour_Corrected,  post_ops=[],
-                    inferred_pic_dir=None
+                    inferred_pic_dir=curr_inf_dir if debug_mode else curr_res_dir
                 )
                 
                 # [EcoRel / Defect Detection Setting] -> General Defect Detection Fallback
@@ -421,7 +497,7 @@ class DinoStrategy(AnalysisStrategy):
                         
                         save_vis = self.context.get('general_defect_save_vis') or self.context.get('defect_detection_debug')
                         gd_fname = f"{os.path.splitext(file)[0]}_FM_detected.jpg"
-                        gd_path = os.path.join(reference_dir, gd_fname) if save_vis else None
+                        gd_path = os.path.join(curr_ref_dir, gd_fname) if save_vis else None
                         
                         # Unpack properly
                         bbox_general_FM = utils_general.perform_general_defect_detection(
@@ -479,8 +555,26 @@ class DinoStrategy(AnalysisStrategy):
             ops_to_run = []
             
             # Check Defect Identification for "+Filtering[xxx]"
-            method_col = next((c for c in fm_df.columns if _norm(c) in ('defectidentification', 'defect_identification')), None)
-            ident_method = str(fm_row[method_col]).strip() if fm_row is not None and method_col else ''
+            # First respect config_group_override if provided by dispatcher
+            ident_method = ''
+            flow_df_raw = cfg_mgr.get_sheet('Flow')
+            cg_override = self.context.get('config_group_override')
+            
+            if not flow_df_raw.empty:
+                if cg_override:
+                    flow_cg_matches = flow_df_raw[
+                        (flow_df_raw['Failure Mode'].astype(str).apply(_norm) == _norm(self.fm)) &
+                        (flow_df_raw['Config_Group'].astype(str).apply(_norm) == _norm(cg_override))
+                    ]
+                    if not flow_cg_matches.empty:
+                        method_col = next((c for c in flow_df_raw.columns if _norm(c) in ('defectidentification', 'defect_identification')), None)
+                        ident_method = str(flow_cg_matches.iloc[0][method_col]).strip() if method_col else ''
+                        
+            if not ident_method:
+                # Fallback to default logic
+                method_col = next((c for c in fm_df.columns if _norm(c) in ('defectidentification', 'defect_identification')), None)
+                ident_method = str(fm_row[method_col]).strip() if fm_row is not None and method_col else ''
+                
             if '+filtering' in ident_method.lower():
                 # Extract the filtering parts
                 ident_parts = ident_method.split('+')
@@ -503,7 +597,7 @@ class DinoStrategy(AnalysisStrategy):
                     
                 final_defect_mask, _, _, _, _ = fo.apply_filtering(
                     final_defect_mask, DUT_Corrected, ops_to_run, filtering_df,
-                    reference_dir, path_to_process, contour_image=Contour_Corrected,
+                    curr_ref_dir, path_to_process, contour_image=Contour_Corrected,
                     adaptive_gaussian_config=current_adaptive_gaussian_config,
                     visualization_overlay=None,
                     defect_id_method='Dino',
@@ -513,115 +607,78 @@ class DinoStrategy(AnalysisStrategy):
             if final_defect_mask is not None and np.any(final_defect_mask):
                     print(f">>> [Strategy] Defect found! Calculating dimensions...")
                     try:
+                        # 计算 DUT 的真实像素面积
+                        dut_contour_area = 1.0
+                        if Contour_Corrected is not None:
+                            dut_contour_area = float(np.count_nonzero(Contour_Corrected))
+                            if dut_contour_area == 0: dut_contour_area = 1.0
+                            
+                        extracted_results = output_ops.extract_parametric_results(
+                            defect_mask=final_defect_mask,
+                            original_img=DUT_Corrected,
+                            file_name=file,
+                            root_dir=curr_res_dir,
+                            defect_output_format=dof,
+                            dut_area=dut_contour_area, # 修复：传入真实的物体面积而不是写死的 1.0
+                            defect_class='Crack',
+                            ref_params=utils_general.Reference_Params,
+                            output_config=utils_general.Output_Config,
+                            gray_scale_params=utils_general.Gray_Scale_Params
+                        )
+                        
+                        # Apply line shape metrics and Scope Filtering since Fraying uses them
                         mask_uint8 = (final_defect_mask.astype(np.uint8) * 255) if final_defect_mask.dtype == bool else final_defect_mask
                         contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        debug_iou_data = []
                         
-                        debug_iou_data = [] # Store data for debug_iou image
-                        
-                        for idx, contour in enumerate(contours):
-                            contour_area = cv2.contourArea(contour)
-                            if contour_area < 5: # Filter out absolute noise
-                                continue
-                            
-                            single_mask = np.zeros_like(mask_uint8)
-                            cv2.drawContours(single_mask, [contour], -1, 255, -1)
-                            
-                            dims_res_single = output_ops.calculate_parametric_dimensions(
-                            defect_cnt=contour,
-                            dut_dims=DUT_Corrected.shape[:2],
-                                ref_params=utils_general.Reference_Params,
-                                output_config=utils_general.Output_Config,
-                                contour_area_val=contour_area,
-                                ref_area=1.0,
-                                ref_found=True,
-                                defect_mask=single_mask,
-                                is_line_shape=True,
-                                image=DUT_Corrected,
-                                gray_scale_params=utils_general.Gray_Scale_Params,
-                                output_dir=res_path,
-                                image_filename=path_to_process,
-                                detector=self.dut_predictor
-                            )
-                                
-                            p_dict = {'Picture_Name': file, 'Defect_Class': 'Crack'}
-                            
-                            # Add 'Detected Defect' from EcoRel bounding boxes
-                            print(f"DEBUG: Checking bbox_general_FM: {bool(bbox_general_FM)}")
+                        for i, res in enumerate(extracted_results):
+                            res['Dir'] = rel_path
+                            res['Detected Defect'] = ''
                             current_defect_mode = None
                             
-                            # Use labels from the new Scope Filter if available
-                            if detected_labels:
-                                current_defect_mode = ", ".join(detected_labels)
-                                print(f"DEBUG: Selected '{current_defect_mode}' as Detected Defect from Scope Filter.")
-                            elif bbox_general_FM:
-                                dx, dy, dw, dh = cv2.boundingRect(contour)
-                                cnt_area = dw * dh
-                                if cnt_area > 0:
-                                    best_overlap = 0
-                                    for gdd in bbox_general_FM:
-                                        if isinstance(gdd, dict):
-                                            bbox = gdd['bbox']
-                                            cls_name = gdd['class_name']
-                                        else:
-                                            bbox = gdd
-                                            cls_name = "Component"
-                                            
-                                        if str(cls_name) == "0":
-                                            cls_name = "Body"
-                                            
-                                        gx1, gy1, gx2, gy2 = map(int, bbox)
-                                        
-                                        # Simple intersection
-                                        ix1 = max(dx, gx1)
-                                        iy1 = max(dy, gy1)
-                                        ix2 = min(dx + dw, gx2)
-                                        iy2 = min(dy + dh, gy2)
-                                        
-                                        inter_w = max(0, ix2 - ix1)
-                                        inter_h = max(0, iy2 - iy1)
-                                        inter_area = inter_w * inter_h
-                                        
-                                        overlap_ratio = inter_area / cnt_area
-                                        # DEBUG
-                                        print(f"DEBUG(IoU): Crack bounding box {dx},{dy},{dw},{dh} overlaps with {cls_name} box {gx1},{gy1},{gx2},{gy2}. Ratio: {overlap_ratio:.3f}")
-                                        
-                                        # We need to filter out the entire "DUT" or "Background" box if it just matches everything.
-                                        # In this case, "Class_0" is likely the entire Power Adapter body!
-                                        # If a Crack is fully inside the main body (overlap = 1.0), we don't really want to label it as "Component" 
-                                        # UNLESS there are no other more specific components.
-                                        # Usually, we want to skip labeling if the box covers the whole image.
-                                        
-                                        if overlap_ratio >= 0.3 and overlap_ratio > best_overlap:
-                                            # Optional: Ignore if it's the main DUT box (usually class 0 or covers > 80% of image)
-                                            if (gx2 - gx1) * (gy2 - gy1) < (DUT_Corrected.shape[0] * DUT_Corrected.shape[1] * 0.9):
-                                                best_overlap = overlap_ratio
-                                                current_defect_mode = cls_name
-                                                print(f"DEBUG: Selected '{current_defect_mode}' as Detected Defect.")
-                                            
-                            p_dict['Detected Defect'] = current_defect_mode if current_defect_mode else ''
-                            
-                            # Store for visualization
-                            debug_iou_data.append({
-                                'contour': contour,
-                                'defect_mode': current_defect_mode
-                            })
-                            
-                            p_dict.update(dims_res_single)
-                            
-                            # Curved Line Measurement
-                            try:
-                                from skimage.morphology import skeletonize
-                                skeleton = skeletonize(single_mask // 255)
-                                curved_len = np.sum(skeleton) * 0.0626
-                                p_dict['Curved Line Measurement'] = curved_len
-                            except ImportError:
-                                pass
-    
-                            parametric_results.append(p_dict)
+                            # Dino Strategy legacy specific additions
+                            if dof != 'combined' and i < len(contours):
+                                cnt = contours[i]
+                                
+                                # Use labels from the new Scope Filter if available
+                                if detected_labels:
+                                    current_defect_mode = ", ".join(detected_labels)
+                                    res['Detected Defect'] = current_defect_mode
+                                
+                                debug_iou_data.append({'contour': cnt, 'defect_mode': current_defect_mode})
+                                if calc_curved_line:
+                                    try:
+                                        from skimage.morphology import skeletonize
+                                        single_mask = np.zeros_like(mask_uint8)
+                                        cv2.drawContours(single_mask, [cnt], -1, 255, -1)
+                                        skeleton = skeletonize(single_mask // 255)
+                                        # Use reference scaling if available, else pixel count
+                                        scale_factor = 1.0
+                                        if 'Length' in utils_general.Reference_Params and hasattr(output_ops, 'calculate_parametric_dimensions'):
+                                            # We could fetch dynamic scale from extracted_results if we want, but for now we fallback to 1.0 or pixel count
+                                            # Actually extracted_results[i] might have 'Length_Ratio' we could reverse engineer,
+                                            # but simpler is just output pixels if no hardcoded conversion is known
+                                            scale_factor = 1.0 
+                                        res['Curved Line Measurement'] = np.sum(skeleton) * scale_factor
+                                    except: pass
+                            elif dof == 'combined' and i == 0 and len(contours) > 0:
+                                # For combined, we just use the first contour for the debug map temporarily
+                                if detected_labels:
+                                    current_defect_mode = ", ".join(detected_labels)
+                                    res['Detected Defect'] = current_defect_mode
+                                debug_iou_data.append({'contour': contours[0], 'defect_mode': current_defect_mode})
+                                if calc_curved_line:
+                                    try:
+                                        from skimage.morphology import skeletonize
+                                        skeleton = skeletonize(mask_uint8 // 255)
+                                        res['Curved Line Measurement'] = np.sum(skeleton) * 1.0
+                                    except: pass
+
+                        parametric_results.extend(extracted_results)
     
                     except Exception as e:
                         print(f">>> [Strategy] Error extracting parametric dimensions: {e}")
-                        parametric_results.append({'Picture_Name': file, 'Defect_Class': 'Crack'})
+                        parametric_results.append({'Picture_Name': file, 'Defect_Class': 'Crack', 'Dir': rel_path, 'Filename': file})
                         
                     # --- Generate Debug IOU Image ---
                     if self.context.get('defect_detection_debug') or self.context.get('general_defect_save_vis'):
@@ -663,18 +720,18 @@ class DinoStrategy(AnalysisStrategy):
                                 cv2.putText(debug_vis, str(idx), (cX, cY), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
 
                             debug_name = f"{os.path.splitext(file)[0]}_debug_iou.png"
-                            cv2.imwrite(os.path.join(inferred_pic_dir, debug_name), debug_vis)
+                            cv2.imwrite(os.path.join(curr_inf_dir, debug_name), debug_vis)
                             print(f">>> [Strategy] Saved Defect Detection Debug visualization: {debug_name}")
                         except Exception as e:
                             print(f">>> [Strategy] Error generating debug IOU image: {e}")
                     # --- End Generate Debug IOU Image ---
                     import utils.cv_ops as cv_ops
-                    cv_ops.save_inferred_pic_overlay(DUT_Corrected, final_defect_mask, inferred_pic_dir, os.path.splitext(file)[0], input_is_bgr=True)
+                    cv_ops.save_inferred_pic_overlay(DUT_Corrected, final_defect_mask, curr_inf_dir, os.path.splitext(file)[0], input_is_bgr=True)
                             
 
                             
             else:
-                parametric_results.append({'Picture_Name': file, 'Defect_Class': 'Pass'})
+                parametric_results.append({'Picture_Name': file, 'Defect_Class': 'Pass', 'Dir': rel_path, 'Filename': file})
                 
             # Cleanup temp file
             if not debug_mode and os.path.exists(path_to_process):
@@ -693,7 +750,7 @@ class DinoStrategy(AnalysisStrategy):
             df = output_ops.build_parametric_output_df(
                 data=parametric_results,
                 failure_mode=fm,
-                defect_output_format=self.defect_output_df,
+                defect_output_format=dof,
             )
             
             if 'Contour' in pd.DataFrame(parametric_results).columns and 'Contour' not in df.columns:

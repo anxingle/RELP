@@ -1,3 +1,4 @@
+from detectron2.config import get_cfg
 import re
 from detectron2.data import MetadataCatalog
 

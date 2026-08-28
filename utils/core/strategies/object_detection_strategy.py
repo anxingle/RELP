@@ -1,6 +1,5 @@
 import os
 import cv2
-import pickle
 import pandas as pd
 import numpy as np
 import torch
@@ -106,27 +105,7 @@ class ObjectDetectionStrategy(AnalysisStrategy):
         # 3. 加载模型
         try:
             print(f">>> [Strategy] Loading DUT detector. CFG: {cfg_path_dut}, WEIGHTS: {weights_path_dut}")
-            
-            # 使用更纯粹、更安全的数据集名称重置方式：
-            # 在加载模型前，利用 Python 的 mock 机制拦截 MetadataCatalog 中 'defect_test' 的创建与获取，
-            # 从而把 DUT 探测器注册的数据集名称和元数据彻底隔离到另一个独立的 Key 'dut_dataset_key' 中。
-            from detectron2.data import MetadataCatalog
-            original_get = MetadataCatalog.get
-            
-            def safe_get(name):
-                # 只要是在加载 DUT 模型时发起的对 'defect_test' 的请求，我们都重定向到 'dut_dataset_key'
-                if name == "defect_test":
-                    return original_get("dut_dataset_key")
-                return original_get(name)
-                
-            MetadataCatalog.get = safe_get
-            
-            # 安全加载，此时内部注册时会自动写入 'dut_dataset_key'，不会污染 'defect_test'
             dut_predictor = ug.load_detectron2_model(cfg_path_dut, weights_path_dut, score_thresh=0.5)
-            
-            # 加载完成后立即恢复原样，确保后续缺陷检测器（Defect Detector）正常获取并写入 'defect_test'
-            MetadataCatalog.get = original_get
-            
         except Exception as e:
             print(f">>> [Strategy Error] 加载 DUT Detectron 模型失败: {e}")
             return
@@ -305,10 +284,6 @@ class ObjectDetectionStrategy(AnalysisStrategy):
                         continue
                         
                     all_detections_sorted = sorted(all_detections, key=lambda d: d["area"], reverse=True)
-                    # 仅保留面积最大的那个检测到的实例（DUT）
-                    if len(all_detections_sorted) > 1:
-                        print(f"     [Optimization] Found {len(all_detections_sorted)} DUT instances. Retaining only the largest one (Area: {all_detections_sorted[0]['area']:.0f}).")
-                        all_detections_sorted = [all_detections_sorted[0]]
                     
                     # (3) 遍历切割并运行检测
                     for idx, det in enumerate(all_detections_sorted):
@@ -387,11 +362,7 @@ class ObjectDetectionStrategy(AnalysisStrategy):
                                             'Defect Pct': f"{(w_norm * h_norm) * 100:.2f}%", 
                                             'Defect_Type': cls_name,
                                             'Defect_ID': f"Instance_{idx+1}_Defect_{idx_d+1}",
-                                            'Contour': str(contour_points),
-                                            'cx': round(cx_norm, 4),
-                                            'cy': round(cy_norm, 4),
-                                            'w': round(w_norm, 4),
-                                            'h': round(h_norm, 4)
+                                            'Contour': str(contour_points)
                                         }
                                         data_list.append(row_data)
                                         

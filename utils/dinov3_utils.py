@@ -27,8 +27,8 @@ import pandas as pd
 from utils.utils_general import apply_filtering
 from utils import utils_general
 
-# Ensure AnyUp-main is in path
-anyup_path = os.path.join(project_root, 'anyup-main')
+# Modern AnyUp Integration
+anyup_path = os.path.join(project_root, 'Dinomaly', 'anyup-main')
 if anyup_path not in sys.path:
     sys.path.append(anyup_path)
 
@@ -37,6 +37,84 @@ try:
 except ImportError as e:
     AnyUp = None
     print(f"Warning: Could not import AnyUp model. Error: {e}")
+
+def load_anyup_upsampler(device):
+    if AnyUp is None:
+        print("AnyUp module not imported. Skipping AnyUp loading.")
+        return None
+    print(">>> Loading Modern AnyUp Model...")
+    try:
+        model = AnyUp()
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        weights_dir = os.path.join(os.path.dirname(current_dir), 'weights')
+        weight_path = os.path.join(weights_dir, 'anyup_paper.pth')
+        if os.path.exists(weight_path):
+            model.load_state_dict(torch.load(weight_path, map_location=device))
+            print(f"AnyUp weights loaded from {weight_path}")
+        else:
+            print(f"AnyUp weights not found at {weight_path}")
+            return None
+            
+        model = model.to(device)
+        # MPS 芯片在使用 FP16 时容易在 RoPE 或 Attention 中发生类型冲突导致崩溃。
+        # 因此，在 MPS 设备上保持 FP32 运行，依靠分块和尺寸限制来防爆显存。
+        if device.type == 'mps':
+            print("Running AnyUp model on MPS using FP32 (Half precision disabled to avoid type mismatch)...")
+            # model = model.half() # Disabled FP16 for MPS
+        elif device.type == 'cuda':
+            print("Converting AnyUp model to FP16 for CUDA memory optimization...")
+            model = model.half()
+            
+        model.eval()
+        return model
+    except Exception as e:
+        print(f"AnyUp loading failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def cal_anomaly_maps_anyup(upsampler, img_tensor, en_list, de_list, target_size):
+    total_a_map = None
+    count = 0
+    import torch.nn.functional as F
+    
+    for i in range(len(de_list)):
+        if i >= len(en_list): break
+        
+        feat_en = en_list[i]
+        feat_de = de_list[i]
+        
+        # Device/Dtype sync
+        up_device = next(upsampler.parameters()).device
+        up_dtype = next(upsampler.parameters()).dtype
+        
+        if i == 0:
+            print(f"DEBUG: AnyUp is currently computing on Device: [{up_device}] with Precision: [{up_dtype}]")
+        
+        c_img = img_tensor.to(up_device)
+        c_en = feat_en.to(up_device)
+        c_de = feat_de.to(up_device)
+        
+        if up_dtype == torch.float16:
+            c_img, c_en, c_de = c_img.half(), c_en.half(), c_de.half()
+        else: # float32 fallback (which MPS now uses)
+            c_img, c_en, c_de = c_img.float(), c_en.float(), c_de.float()
+            
+        # Native Chunking Inference
+        u_en = upsampler(c_img, c_en, output_size=target_size, q_chunk_size=128)
+        u_de = upsampler(c_img, c_de, output_size=target_size, q_chunk_size=128)
+        
+        a_map = 1 - F.cosine_similarity(u_en, u_de)
+        a_map = torch.unsqueeze(a_map, dim=1).float() # Keep map in float32
+        
+        if total_a_map is None:
+            total_a_map = a_map
+        else:
+            total_a_map += a_map
+        count += 1
+        
+    anomaly_map = total_a_map / count if count > 0 else total_a_map
+    return anomaly_map.to(img_tensor.device), []
 
 
 try:
@@ -177,241 +255,6 @@ def load_model(model_path, device):
     model = model.to(device)
     model.eval()
     return model
-
-def load_anyup_upsampler(device):
-    """Load AnyUp upsampler"""
-    try:
-        if AnyUp is None:
-            print("AnyUp module not imported. Skipping AnyUp loading.")
-            return None
-            
-        print("Loading AnyUp model...")
-        # use_natten=False by default to avoid issues, as per user experience
-        model = AnyUp(use_natten=False).to(device)
-        
-        # FP16 Optimization for MPS (User Request)
-        if device.type == 'mps':
-            print("Converting AnyUp model to FP16 (Half) for MPS memory optimization...")
-            model = model.half()
-        
-        # Load weights
-        # Resolve absolute path for weights robustly
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.dirname(current_dir)
-        weights_dir = os.path.join(project_root, 'weights')
-        weight_path = os.path.join(weights_dir, 'anyup_paper.pth')
-        
-        if os.path.exists(weight_path):
-            print(f"Loading AnyUp weights from {weight_path}")
-            state_dict = torch.load(weight_path, map_location=device)
-            model.load_state_dict(state_dict)
-        else:
-            print(f"AnyUp weights not found at {weight_path}. Attempting download...")
-            try:
-                checkpoint_url = "https://github.com/wimmerth/anyup/releases/download/checkpoint/anyup_paper.pth"
-                state_dict = torch.hub.load_state_dict_from_url(checkpoint_url, progress=True, map_location=device)
-                model.load_state_dict(state_dict)
-                print("AnyUp weights downloaded and loaded successfully.")
-                
-                # Optionally save them
-                try:
-                    os.makedirs(weights_dir, exist_ok=True)
-                    torch.save(state_dict, weight_path)
-                    print(f"Saved downloaded weights to {weight_path}")
-                except Exception as e:
-                    print(f"Could not save weights locally: {e}")
-            except Exception as e:
-                 print(f"Failed to download AnyUp weights: {e}")
-                 return None
-        
-        model.eval()
-        print("AnyUp upsampler loaded successfully!")
-        return model
-        
-    except Exception as e:
-        print(f"AnyUp loading failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
-
-def upsample_features_tiled(upsampler, hr_image, lr_features, target_size):
-    """
-    Use Upsampler (AnyUp) for feature upsampling with Tiled Processing.
-    This is crucial for handling large target sizes (e.g. 1280x1280) on limited memory.
-    """
-    if upsampler is None:
-        return torch.nn.functional.interpolate(
-            lr_features, size=target_size, mode='bilinear', align_corners=True
-        )
-    
-    try:
-        # Determine tile size based on target size and device capabilities
-        # A 512x512 tile results in attention map of (512*512) * (patch_size_area)
-        # Reduced to 128 to avoid OOM on MPS (approx 34GB for 512x512 with 4 heads)
-        
-        # Tiling Logic REMOVED. Always use full pass.
-        tile_size = max(target_size[0], target_size[1])
-        overlap = 0
-        # print(f"DEBUG: Tiling disabled. Using full pass for target size {target_size}.")
-        
-        # If target size is small enough, run directly
-        if target_size[0] <= tile_size and target_size[1] <= tile_size:
-            with torch.no_grad():
-                # FP16 Handling for MPS
-                input_img = hr_image
-                input_feat = lr_features
-                
-                if next(upsampler.parameters()).dtype == torch.float16:
-                    if input_img.dtype != torch.float16:
-                        input_img = input_img.half()
-                    if input_feat.dtype != torch.float16:
-                        input_feat = input_feat.half()
-                
-                out = upsampler(input_img, input_feat, output_size=target_size)
-                
-                # Convert back to float32 for safety in downstream tasks
-                if out.dtype == torch.float16:
-                    out = out.float()
-                    
-                return out
-
-        # Prepare for Tiling
-        B, C, H_in, W_in = lr_features.shape
-        H_out, W_out = target_size
-        
-        # Initialize Output Tensor
-        # Heuristic: If tensor is small enough (< 3GB), keep on device (MPS) for speed.
-        # Otherwise use CPU to avoid OOM.
-        tensor_elements = B * C * H_out * W_out
-        tensor_bytes = tensor_elements * 4 # float32
-        gb_size = tensor_bytes / (1024**3)
-        
-        target_device = lr_features.device
-        # 3GB threshold for safety (MPS shared memory usually > 8GB, but other things take space)
-        # For 640x640, size is ~1.2GB, so it will use MPS.
-        if gb_size < 3.0: 
-             output_device = target_device
-             print(f"DEBUG: Output tensor size {gb_size:.2f} GB. Using Device: {output_device}")
-        else:
-             output_device = 'cpu'
-             print(f"DEBUG: Output tensor size {gb_size:.2f} GB > 3GB. Using CPU to avoid OOM.")
-
-        output = torch.zeros((B, C, H_out, W_out), device=output_device)
-        # Count tensor for averaging overlaps
-        count_map = torch.zeros((1, 1, H_out, W_out), device=output_device)
-        
-        # FP16 Handling for Tiling
-        input_img_tiled = hr_image
-        input_feat_tiled = lr_features
-        if next(upsampler.parameters()).dtype == torch.float16:
-            if input_img_tiled.dtype != torch.float16:
-                input_img_tiled = input_img_tiled.half()
-            if input_feat_tiled.dtype != torch.float16:
-                input_feat_tiled = input_feat_tiled.half()
-
-        # Generate Full Coordinate Grid (1, H_out, W_out, 2) in range [-1, 1]
-        # This grid represents where we want to sample in the "Query Image" space.
-        # Since AnyUp maps the Query Image (hr_image) to [-1, 1], we just need a grid covering that.
-        xs = torch.linspace(-1, 1, W_out, device=lr_features.device)
-        ys = torch.linspace(-1, 1, H_out, device=lr_features.device)
-        grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
-        full_grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0) # (1, H, W, 2)
-
-        # Create grid of tiles
-        stride = tile_size - overlap
-        h_starts = list(range(0, H_out, stride))
-        w_starts = list(range(0, W_out, stride))
-        
-        # Helper for Gaussian Blending Mask
-        def get_blending_mask(h, w, device):
-            # Create a 2D pyramid/trapezoid mask
-            # Linear fade at edges
-            # For simplicity, use min(dist_to_edge)
-            
-            # X dimension
-            xs = torch.linspace(0, 1, w, device=device)
-            # Create a ramp up and down: / \
-            # If w is small, it's just a triangle.
-            # Ideally we want flat center and fade edges.
-            
-            # Simple Hann window approximation
-            if w > 1:
-                wx = torch.sin(torch.pi * xs)**2
-            else:
-                wx = torch.ones(w, device=device)
-                
-            if h > 1:
-                ys = torch.linspace(0, 1, h, device=device)
-                wy = torch.sin(torch.pi * ys)**2
-            else:
-                wy = torch.ones(h, device=device)
-                
-            # Outer product
-            mask = torch.ger(wy, wx).unsqueeze(0).unsqueeze(0) # (1, 1, h, w)
-            return mask
-
-        with torch.no_grad():
-            for h_s in h_starts:
-                for w_s in w_starts:
-                    h_e = min(h_s + tile_size, H_out)
-                    w_e = min(w_s + tile_size, W_out)
-                    
-                    curr_h = h_e - h_s
-                    curr_w = w_e - w_s
-                    
-                    if curr_h <= 0 or curr_w <= 0: continue
-                    
-                    # Extract tile grid
-                    # full_grid is (1, H, W, 2)
-                    tile_grid = full_grid[:, h_s:h_e, w_s:w_e, :]
-                    
-                    # Call Upsampler with specific query coordinates
-                    # Note: We modified AnyUp to accept query_coords
-                    try:
-                        # Use FP16 inputs if model is FP16
-                        t_img = input_img_tiled
-                        t_feat = input_feat_tiled
-                        
-                        tile_output = upsampler(t_img, t_feat, output_size=(curr_h, curr_w), query_coords=tile_grid)
-                        
-                        # Add to output (Handle device mismatch)
-                        res = tile_output.float()
-                        if output.device != res.device:
-                            res = res.to(output.device)
-                        
-                        # Apply Blending Mask
-                        # Only apply if we are actually tiling (overlap > 0)
-                        if overlap > 0:
-                             mask = get_blending_mask(curr_h, curr_w, res.device)
-                             if output.device != mask.device:
-                                 mask = mask.to(output.device)
-                             
-                             output[:, :, h_s:h_e, w_s:w_e] += res * mask
-                             count_map[:, :, h_s:h_e, w_s:w_e] += mask
-                        else:
-                             # No overlap, simple addition (should be unique anyway)
-                             output[:, :, h_s:h_e, w_s:w_e] += res
-                             count_map[:, :, h_s:h_e, w_s:w_e] += 1.0
-                        
-                    except TypeError as te:
-                        if "unexpected keyword argument 'query_coords'" in str(te):
-                             print("Error: AnyUp model does not support 'query_coords'. Please update AnyUp code.")
-                             raise te
-                        else:
-                             raise te
-        
-        # Average overlaps
-        # Avoid division by zero
-        count_map[count_map == 0] = 1.0
-        output = output / count_map
-        
-        return output
-
-    except RuntimeError as e:
-        print(f"Upsampling failed (likely OOM or dimension mismatch), using bilinear interpolation: {e}")
-        return torch.nn.functional.interpolate(
-            lr_features, size=target_size, mode='bilinear', align_corners=True
-        )
 
 def read_dino_threshold_config(config_path='Anomaly_config.xlsx'):
     """Read Dino_TH sheet from config file to get transparency threshold range."""
@@ -782,72 +625,6 @@ def check_and_save_intermediate(op_keyword, post_ops, mask, original_img, save_d
         print(f"Saved intermediate result to: {save_path}")
 
 
-def cal_anomaly_maps_upsampler_efficient(upsampler, img_tensor, en_list, de_list, target_size):
-    """
-    Perform super-resolution upsampling and anomaly map calculation iteratively to save memory.
-    Avoids storing all upsampled features (which are huge: 1280x1280x768) in memory.
-    Works for AnyUp.
-    """
-    total_a_map = None
-    count = 0
-    
-    # Iterate over layers (Assuming en_list and de_list have same length)
-    for i in range(len(de_list)):
-        if i >= len(en_list):
-            break
-            
-        feat_en = en_list[i]
-        feat_de = de_list[i]
-        
-        try:
-            # Upsample en
-            u_en = upsample_features_tiled(upsampler, img_tensor, feat_en, target_size)
-            
-            # Upsample de
-            u_de = upsample_features_tiled(upsampler, img_tensor, feat_de, target_size)
-            
-            # Ensure same device (handle fallback case where one might be GPU)
-            if u_en.device != u_de.device:
-                # Prefer CPU if one is CPU (to save memory)
-                if u_en.device.type == 'cpu':
-                    u_de = u_de.cpu()
-                else:
-                    u_en = u_en.cpu()
-            
-            # Calculate cosine distance
-            # u_en, u_de are (B, C, H, W)
-            a_map = 1 - F.cosine_similarity(u_en, u_de)
-            a_map = torch.unsqueeze(a_map, dim=1) # (B, 1, H, W)
-            
-            # Ensure size
-            if a_map.shape[-2:] != target_size:
-                 # Use bicubic for smoother results
-                 a_map = F.interpolate(a_map, size=target_size, mode='bicubic', align_corners=True)
-                 
-            if total_a_map is None:
-                total_a_map = a_map
-            else:
-                total_a_map += a_map
-                
-            count += 1
-            
-            # Free memory
-            del u_en
-            del u_de
-            
-        except Exception as e:
-            print(f"Error processing layer {i} in Upsampler efficient: {e}")
-            raise e # Re-raise to trigger fallback in the caller
-            
-    if count > 0:
-        anomaly_map = total_a_map / count
-        # Move back to original device (small tensor now, 1 channel)
-        anomaly_map = anomaly_map.to(img_tensor.device)
-    else:
-        # Should not happen usually
-        anomaly_map = torch.zeros((img_tensor.shape[0], 1, *target_size), device=img_tensor.device)
-        
-    return anomaly_map, []
 
 
 def process_single_image_pipeline(image_path, model, upsampler, device, save_dir, 
@@ -1258,20 +1035,13 @@ def process_single_image_pipeline(image_path, model, upsampler, device, save_dir
         # Model inference
         output = model(img_tensor)
         en, de = output[0], output[1]
-        
+
         # If Upsampler (AnyUp) is available, upsample encoder features
         upsampler_used = False
         if upsampler is not None:
-            # Calculate super-resolution target size
             base_h, base_w = img_tensor.shape[-2], img_tensor.shape[-1]
-            
-            # Check for global custom target size (from Flow Table 'Upsampling Definition')
             if hasattr(utils_general, 'Upsampling_Target_Size') and utils_general.Upsampling_Target_Size is not None:
-                custom_size = utils_general.Upsampling_Target_Size
-                super_h = custom_size
-                super_w = custom_size
-                print(f"DEBUG: Using Custom Upsampling Target Size: {super_h}x{super_w}")
-                # Recalculate effective scale factor for logging/logic
+                super_h = super_w = utils_general.Upsampling_Target_Size
                 current_scale_factor = super_h / base_h
             else:
                 super_h = int(base_h * super_resolution_factor)
@@ -1279,38 +1049,23 @@ def process_single_image_pipeline(image_path, model, upsampler, device, save_dir
                 current_scale_factor = super_resolution_factor
                 
             target_size = (super_h, super_w)
+            print(f"Using upsampler ({upsampler.__class__.__name__}) for super-resolution upsampling: {base_h}x{base_w} -> {super_h}x{super_w} (Scale: {current_scale_factor:.2f})")
             
-            # Force Run Upsampler even if sizes match (User Request)
-            if super_h == base_h and super_w == base_w:
-                print(f"Skipping Upsampler as target size matches input size: {base_h}x{base_w}")
+            try:
+                print("🚀 >>> AnyUp Process STARTED: Upsampling encoder features... <<< 🚀")
+                anomaly_map, a_map_list = cal_anomaly_maps_anyup(upsampler, img_tensor, en, de, target_size)
+                print("✅ >>> AnyUp Process SUCCESSFUL: Super-resolution process finished. <<< ✅")
+                upsampler_used = True
+            except Exception as e:
+                print(f"❌ >>> AnyUp Process FAILED: {e}. Falling back to low-res features! <<< ❌")
                 anomaly_map, a_map_list = cal_anomaly_maps(en, de, (img_tensor.shape[-2], img_tensor.shape[-1]))
                 upsampler_used = False
-            else:
-                print(f"Using upsampler ({upsampler.__class__.__name__}) for super-resolution upsampling: {base_h}×{base_w} → {super_h}×{super_w} (Scale: {current_scale_factor:.2f})")
-                
-                try:
-                    # Use AnyUp upsampling (Full Pass)
-                    print("Using AnyUp upsampling (Full Pass)...")
-                    anomaly_map, a_map_list = cal_anomaly_maps_upsampler_efficient(
-                        upsampler, img_tensor, en, de, target_size
-                    )
-                    
-                    print(f"Super-resolution process finished ({upsampler.__class__.__name__}).")
-                    upsampler_used = True
-                    
-                except Exception as e:
-                    print(f"Error occurred during upsampling: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    print("Falling back to original features for anomaly map calculation...")
-                    anomaly_map, a_map_list = cal_anomaly_maps(en, de, (img_tensor.shape[-2], img_tensor.shape[-1]))
-                    upsampler_used = False
         else:
-            print("Upsampler is None. Using standard feature maps.")
             anomaly_map, a_map_list = cal_anomaly_maps(en, de, (img_tensor.shape[-2], img_tensor.shape[-1]))
             upsampler_used = False
         
-        # Apply Gaussian smoothing
+
+# Apply Gaussian smoothing
         anomaly_map = gaussian_kernel(anomaly_map)
         
         # Process anomaly map
@@ -1336,11 +1091,7 @@ def process_single_image_pipeline(image_path, model, upsampler, device, save_dir
         else:
             # Original logic: Crop padding (Remove black borders)
             # Note: pad values need to be scaled if SR is used
-            if hasattr(utils_general, 'Upsampling_Target_Size') and utils_general.Upsampling_Target_Size is not None and upsampler_used:
-                 # Calculate dynamic scale factor for this specific image
-                 scale_factor = utils_general.Upsampling_Target_Size / base_h
-            else:
-                 scale_factor = super_resolution_factor if upsampler_used else 1.0
+            scale_factor = (utils_general.Upsampling_Target_Size / base_h) if (hasattr(utils_general, 'Upsampling_Target_Size') and utils_general.Upsampling_Target_Size is not None and upsampler_used) else (super_resolution_factor if upsampler_used else 1.0)
             
             c_pad_top = int(active_pad_top * scale_factor)
             c_pad_bottom = int(active_pad_bottom * scale_factor)
@@ -1392,19 +1143,7 @@ def process_single_image_pipeline(image_path, model, upsampler, device, save_dir
             
             # Calculate target dimensions for resizing anomaly map (matching the eventual cropped original_img)
             # This ensures binary_mask and object_mask have matching dimensions
-            #
-            # CRITICAL FIX: The anomaly map from AnyUp is in SR space (e.g., 640x640) which corresponds to the
-            # PADDED input size (max_dim_h x max_dim_w = 192x1280), not the original content size.
-            # 
-            # The original_img is generated from 'image' (PIL) which has dimensions content_w x content_h (1248x190),
-            # NOT the padded dimensions. So original_img has shape (190, 1248, 3).
-            #
-            # To ensure proper alignment, we need to:
-            # 1. First resize anomaly map from SR space (640x640) to padded dimensions (192x1280)
-            # 2. Then crop out the padding to match original_img dimensions (190x1248)
-            #
-            # This two-step process ensures the aspect ratio is preserved and spatial alignment is correct.
-            
+            #            
             # Step 1: Resize anomaly map to padded input dimensions
             if current_anomaly_map.shape != (max_dim_h, max_dim_w):
                 print(f"Resizing anomaly map from {current_anomaly_map.shape} to padded dimensions {max_dim_h}x{max_dim_w}")
@@ -1482,6 +1221,10 @@ def process_single_image_pipeline(image_path, model, upsampler, device, save_dir
         if isinstance(transparency_threshold, (tuple, list)) and len(transparency_threshold) == 2:
             dino_threshold = transparency_threshold
             print(f"DEBUG: Using provided transparency_threshold as Dino Threshold: {dino_threshold}")
+        elif isinstance(transparency_threshold, (float, int)):
+            # 如果传入的是像 0.0 这样的单一浮点数（来自 fallback），我们也把它视为 raw_low 阈值
+            dino_threshold = (float(transparency_threshold), None)
+            print(f"DEBUG: Using provided scalar transparency_threshold as Dino Threshold: {dino_threshold}")
         else:
             dino_threshold = read_dino_threshold_config()
         
@@ -1695,36 +1438,35 @@ def process_single_image_pipeline(image_path, model, upsampler, device, save_dir
              heatmap_resized_for_vis = heatmap_normalized
 
         # 2. Create Solid Heatmap (JET)
-        heatmap_solid_vis = cv2.applyColorMap(np.uint8(255 * heatmap_resized_for_vis), cv2.COLORMAP_JET)
+        heatmap_solid_vis = cv2.applyColorMap(np.clip(255 * heatmap_resized_for_vis, 0, 255).astype(np.uint8), cv2.COLORMAP_JET)
         heatmap_solid_vis = cv2.cvtColor(heatmap_solid_vis, cv2.COLOR_BGR2RGB) # Ensure RGB for blending with original_img (RGB)
 
         # 3. Create Overlay with fixed 70% transparency (30% opacity of heatmap)
         # User request: "Load on original image with 70% transparency" -> 0.7 Original + 0.3 Heatmap
         heatmap_overlay_full = cv2.addWeighted(original_img, 0.7, heatmap_solid_vis, 0.3, 0)
 
-        # --- Save AnyUp Overlay to save_dir (reference folder) if AnyUp was used ---
+
+        # --- Save AnyUp Overlay ---
         if upsampler_used:
              try:
-                 # Construct filename
-                 # image_path is available in this scope
-                 # Use os.path.splitext to handle filenames with dots (e.g., "0.08")
                  base_name = os.path.splitext(os.path.basename(image_path))[0]
-
-                 # Save to save_dir (reference folder) only
+                 
+                 # Save to Inferred Pic explicitly (ignoring all other conditions)
+                 if inferred_pic_dir and os.path.exists(inferred_pic_dir):
+                     inferred_path = os.path.join(inferred_pic_dir, f"{base_name}_overlay_anyup.png")
+                     success = cv2.imwrite(inferred_path, cv2.cvtColor(heatmap_overlay_full, cv2.COLOR_RGB2BGR))
+                     if success:
+                         print(f"DEBUG: Saved AnyUp overlay to Inferred Pic: {inferred_path}")
+                 
+                 # Also save to reference dir
                  if save_dir and os.path.exists(save_dir):
                      ref_path_local = os.path.join(save_dir, f"{base_name}_overlay_anyup.png")
                      success_local = cv2.imwrite(ref_path_local, cv2.cvtColor(heatmap_overlay_full, cv2.COLOR_RGB2BGR))
                      if success_local:
-                         print(f"DEBUG: Saved AnyUp overlay to save_dir: {ref_path_local}")
-                     else:
-                         print(f"Error: cv2.imwrite failed for {ref_path_local}")
-                 else:
-                     print(f"DEBUG: save_dir not available, skipping AnyUp overlay save")
-
+                         print(f"DEBUG: Saved AnyUp overlay to reference dir: {ref_path_local}")
              except Exception as e:
                  print(f"Warning: Failed to save AnyUp overlay: {e}")
-                 import traceback
-                 traceback.print_exc()
+                 
 
         if post_ops is not None and len(post_ops) > 0:
             print(f"DEBUG: Applying Centralized Filtering with ops: {post_ops}")
@@ -1774,22 +1516,19 @@ def process_single_image_pipeline(image_path, model, upsampler, device, save_dir
             else:
                  mask_for_overlay = mask_filtered.astype(np.uint8)
             
-            # Create overlay for the final _overlay.png
-            # 0.7 Original + 0.3 Overlay color
+            # [修复]: 之前这里强行生成了一个 [0, 162, 255] (橙色/蓝色) 的纯色色块！
+            # 这是导致所有 Dino 的热力图全部变成了纯蓝色 Mask 的罪魁祸首！
+            # 我们应该直接使用上面已经算好的 heatmap_solid_vis (这是由 JET 色图生成的真实热力颜色)
             
-            # Create a solid overlay image
-            red_layer = np.zeros_like(original_img)
-            red_layer[:] = [0, 162, 255]
-            
-            # Create the blended image (70% transparency = 30% opacity of red)
-            # We want: Final = Original * 0.7 + Red * 0.3
-            blended_red = cv2.addWeighted(original_img, 0.7, red_layer, 0.3, 0)
+            # 使用真实的热力颜色进行混合
+            # We want: Final = Original * 0.7 + Heatmap * 0.3
+            blended_heatmap = cv2.addWeighted(original_img, 0.7, heatmap_solid_vis, 0.3, 0)
             
             heatmap_on_image = original_img.copy()
             
             mask_indices = (mask_for_overlay > 0)
             if np.any(mask_indices):
-                heatmap_on_image[mask_indices] = blended_red[mask_indices]
+                heatmap_on_image[mask_indices] = blended_heatmap[mask_indices]
                 
             heatmap_transparent = heatmap_on_image # For consistency if used elsewhere
             
@@ -1926,11 +1665,20 @@ def process_single_image_pipeline(image_path, model, upsampler, device, save_dir
             heatmap_to_save = heatmap_normalized_raw.copy()
             if heatmap_to_save.shape != (original_img.shape[0], original_img.shape[1]):
                 heatmap_to_save = cv2.resize(heatmap_to_save, (original_img.shape[1], original_img.shape[0]), interpolation=cv2.INTER_LINEAR)
-            heatmap_solid = cv2.applyColorMap(np.uint8(255 * heatmap_to_save), cv2.COLORMAP_JET)
+            heatmap_solid = cv2.applyColorMap(np.clip(255 * heatmap_to_save, 0, 255).astype(np.uint8), cv2.COLORMAP_JET)
+            
+            # The 'original_img' here is NOT the raw image! It is the padded 1280x1280 image fed to DINO!
+            # We MUST use restore_coords_func so that this heatmap actually strips the padding and reverts to the tight bbox!
+            if 'restore_coords_func' in locals():
+                b = restore_coords_func(heatmap_solid[:,:,0])
+                g = restore_coords_func(heatmap_solid[:,:,1])
+                r = restore_coords_func(heatmap_solid[:,:,2])
+                if b is not None and g is not None and r is not None:
+                    heatmap_solid = cv2.merge([b, g, r])
+                    
             cv2.imwrite(os.path.join(save_dir, f"{filename}_heatmap{suffix}.png"), heatmap_solid)
         
         if upsampler is not None and super_resolution_factor > 1.0:
-            print(f"Super-resolution AnyUp results saved to: {save_dir}")
             print(f"Processed resolution: {super_h}×{super_w}, Output resolution: {orig_h}×{orig_w}")
         else:
             print(f"Enhanced results saved to: {save_dir}")
@@ -2116,132 +1864,25 @@ def process_single_image_pipeline(image_path, model, upsampler, device, save_dir
             import traceback
             traceback.print_exc()
 
-        # Save Overlay
-        # 规则：
-        # - 纯 Dino 模式：overlay 写入 Inferred Pic（如有），否则写入 save_dir
-        # - Dino+KNN 等包含 KNN 的组合模式：overlay 仅写入 save_dir，Inferred Pic 最终由 KNN 步写入“交集遮罩红色高亮”的结果
-        overlay_target_dir = save_dir
-        if inferred_pic_dir and not (defect_id_method and ('knn' in str(defect_id_method).lower())):
-            overlay_target_dir = inferred_pic_dir
-        if overlay_target_dir:
-            os.makedirs(overlay_target_dir, exist_ok=True)
-            if overlay_target_dir == inferred_pic_dir:
-                mask_for_save = None
-                if 'mask_for_overlay' in locals():
-                    mask_for_save = mask_for_overlay
-                elif 'binary_mask' in locals():
-                    mask_for_save = binary_mask
-                if mask_for_save is not None:
-                    # In Dino pipeline, original_img might be a resized version
-                    if 'binary_mask' in locals() and binary_mask is not None:
-                        # binary_mask is already restored to full_input_image size!
-                        base_img_for_overlay = full_input_image
-                        # CRITICAL BUG: binary_mask here could be the PRE-RESTORED binary_mask because of python scoping issues
-                        # Wait, let's look at coordinate restoration. We updated binary_mask = restore_coords_func(binary_mask)
-                        # Did we? Let's check! 
-                        # Ah! mask_for_save was captured BEFORE coordinate restoration!
-                        # At line 1916:
-                        # mask_for_save = None
-                        # if 'mask_for_overlay' in locals(): mask_for_save = mask_for_overlay
-                        # elif 'binary_mask' in locals(): mask_for_save = binary_mask
-                        # BUT binary_mask wasn't restored yet if this code is running before restoration, OR if it's using the old `mask_for_overlay`!
-                        # `mask_for_overlay` is sized (1248, 1130).
-                        
-                        mask_to_use = binary_mask
-                        print(f"DEBUG: Using full_input_image {full_input_image.shape} with restored binary_mask {binary_mask.shape if binary_mask is not None else 'None'} for final overlay")
-                    elif 'full_input_image' in locals() and mask_for_save.shape[:2] == full_input_image.shape[:2]:
-                        base_img_for_overlay = full_input_image
-                        mask_to_use = mask_for_save
-                        print(f"DEBUG: Using full_input_image {full_input_image.shape} for final overlay")
-                    else:
-                        base_img_for_overlay = original_img
-                        mask_to_use = mask_for_save
-                        print(f"DEBUG: Using original_img {original_img.shape} for final overlay")
-                        
-                    # Use original_filename to preserve full original name for overlay
-                    print(f"================ CRITICAL OVERLAY DEBUG ================")
-                    print(f"base_img_for_overlay shape: {base_img_for_overlay.shape}")
-                    if mask_to_use is not None:
-                        print(f"mask_to_use shape: {mask_to_use.shape}")
-
-                        y_idx, x_idx = np.where(mask_to_use > 0)
-                        if len(y_idx) > 0:
-                            print(f"mask_to_use defect bounds: x_min={x_idx.min()}, x_max={x_idx.max()}, y_min={y_idx.min()}, y_max={y_idx.max()}")
-                    print(f"=========================================================")
+        # -------------------------------------------------------------
+        # 移除向 Inferred Pic 输出 _overlay_upsampled.jpg 掩码图的遗留逻辑。
+        # 现代架构中，最终的二值化轮廓掩码（_overlay.jpg）已由 Strategy 层
+        # 直接调用 cv_ops 负责生成并统一管理。此处只需在 save_dir 备份一张
+        # 原生渐变热力图（_overlay.png），作为算法调试参考即可。
+        # -------------------------------------------------------------
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+            heatmap_on_image_to_save = heatmap_on_image
+            if 'restore_coords_func' in locals() and heatmap_on_image.shape[:2] != full_input_image.shape[:2]:
+                b = restore_coords_func(heatmap_on_image[:,:,0])
+                g = restore_coords_func(heatmap_on_image[:,:,1])
+                r = restore_coords_func(heatmap_on_image[:,:,2])
+                if b is not None and g is not None and r is not None:
+                    heatmap_on_image_to_save = cv2.merge([b, g, r])
                     
-                    utils_general.save_inferred_pic_overlay(
-                        base_img_for_overlay,
-                        mask_to_use,
-                        overlay_target_dir,
-                        original_filename,
-                        suffix,
-                        input_is_bgr=True
-                    )
-                else:
-                    # Save _overlay.png to reference folder (save_dir), not Inferred Pic
-                    cv2.imwrite(
-                        os.path.join(save_dir, f"{filename}_overlay{suffix}.png"),
-                        cv2.cvtColor(heatmap_on_image, cv2.COLOR_RGB2BGR)
-                    )
-            else:
-                # Save _overlay.png to reference folder (save_dir), not Inferred Pic
-                cv2.imwrite(
-                    os.path.join(save_dir, f"{filename}_overlay{suffix}.png"),
-                    cv2.cvtColor(heatmap_on_image, cv2.COLOR_RGB2BGR)
-                )
-        
-
-
-        # --- NEW: Swap overlay images when Color Space Conversion = Dino_Distance and Upsampling = Yes ---
-        try:
-            # Check conditions: Dino_Distance mode and AnyUp was used
-            gray_scale_params = getattr(utils_general, 'Gray_Scale_Params', {})
-            is_dino_distance = gray_scale_params.get('Mode', '').lower().replace(' ', '').replace('_', '') == 'dinodistance'
-
-            if is_dino_distance and upsampler_used and save_dir and inferred_pic_dir:
-                print("DEBUG: Detected Dino_Distance mode with Upsampling=Yes. Swapping overlay images...")
-
-                # Construct filenames
-                base_name = os.path.splitext(os.path.basename(image_path))[0]
-
-                # Define source and target paths
-                # _overlay_anyup.png is currently in reference folder (save_dir)
-                anyup_src = os.path.join(save_dir, f"{base_name}_overlay_anyup.png")
-                # _overlay_upsampled.jpg is currently in Inferred Pic folder
-                upsampled_src = os.path.join(inferred_pic_dir, f"{base_name}_overlay_upsampled.jpg")
-
-                # Target paths (swapped)
-                anyup_dst = os.path.join(inferred_pic_dir, f"{base_name}_cropped_overlay_anyup.png")
-                upsampled_dst = os.path.join(save_dir, f"{base_name}_cropped_overlay_upsampled.jpg")
-
-                # Swap: Move _overlay_anyup.png to Inferred Pic
-                if os.path.exists(anyup_src):
-                    # Remove existing file at destination if exists
-                    if os.path.exists(anyup_dst):
-                        os.remove(anyup_dst)
-                    # Move file
-                    shutil.move(anyup_src, anyup_dst)
-                    print(f"DEBUG: Moved {anyup_src} -> {anyup_dst}")
-                else:
-                    print(f"DEBUG: Source file not found: {anyup_src}")
-
-                # Swap: Move _overlay_upsampled.jpg to reference folder
-                if os.path.exists(upsampled_src):
-                    # Remove existing file at destination if exists
-                    if os.path.exists(upsampled_dst):
-                        os.remove(upsampled_dst)
-                    # Move file
-                    shutil.move(upsampled_src, upsampled_dst)
-                    print(f"DEBUG: Moved {upsampled_src} -> {upsampled_dst}")
-                else:
-                    print(f"DEBUG: Source file not found: {upsampled_src}")
-
-                print("DEBUG: Overlay image swap completed.")
-            else:
-                print(f"DEBUG: Skipping overlay swap. is_dino_distance={is_dino_distance}, upsampler_used={upsampler_used}, save_dir={save_dir is not None}, inferred_pic_dir={inferred_pic_dir is not None}")
-        except Exception as e:
-            print(f"Warning: Failed to swap overlay images: {e}")
-            import traceback
-            traceback.print_exc()
+            cv2.imwrite(
+                os.path.join(save_dir, f"{filename}_overlay{suffix}.png"),
+                cv2.cvtColor(heatmap_on_image_to_save, cv2.COLOR_RGB2BGR)
+            )
 
         return heatmap_normalized, heatmap_transparent, heatmap_on_image, rgb_result_paths, binary_mask, mask_removed

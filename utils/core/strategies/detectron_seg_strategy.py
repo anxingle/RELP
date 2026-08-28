@@ -446,7 +446,11 @@ class DetectronSegStrategy(AnalysisStrategy):
                             
                             # 生成规范化 Contour 点阵或保存 npy (兼容老代码)
                             # 如果是 Combined 模式，需要把整体 Mask 存为 .npy
-                            dof = str(self.defect_output_df).strip().lower() if hasattr(self, 'defect_output_df') and not (isinstance(self.defect_output_df, pd.DataFrame) and self.defect_output_df.empty) else ''
+                            dof = 'individual'
+                            if hasattr(self, 'defect_output_df') and not self.defect_output_df.empty:
+                                out_match = self.defect_output_df[self.defect_output_df['Failure Mode'].astype(str).str.strip() == self.fm.strip()]
+                                if not out_match.empty:
+                                    dof = str(out_match.iloc[0].get('Defect Output Format', 'individual')).strip().lower()
                             if dof == 'combined':
                                 # Note: the actual mask saving happens after the loop for the whole image
                                 # For the p_dict, we assign a placeholder that will be popped by format_parametric_output_df
@@ -524,7 +528,11 @@ class DetectronSegStrategy(AnalysisStrategy):
                 cv2.imwrite(os.path.join(inferred_dir, f"{image_filename}_overlay.jpg"), overlay)
                 
                 # 如果是 Combined 模式，将 overall_BG 存为 .npy
-                dof = str(self.defect_output_df).strip().lower() if hasattr(self, 'defect_output_df') and not (isinstance(self.defect_output_df, pd.DataFrame) and self.defect_output_df.empty) else ''
+                dof = 'individual'
+                if hasattr(self, 'defect_output_df') and not self.defect_output_df.empty:
+                    out_match = self.defect_output_df[self.defect_output_df['Failure Mode'].astype(str).str.strip() == self.fm.strip()]
+                    if not out_match.empty:
+                        dof = str(out_match.iloc[0].get('Defect Output Format', 'individual')).strip().lower()
                 if dof == 'combined':
                     try:
                         import numpy as np

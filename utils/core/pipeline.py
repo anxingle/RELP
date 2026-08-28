@@ -142,6 +142,10 @@ class DefectDetectionPipeline:
                 elif 'defect' in t_val or 'detectron' in t_val or 'seg' in t_val:
                     if 'cfg' in vn_val and 'cfg_path' not in result: result['cfg_path'] = p_val
                     if 'weight' in vn_val and 'weights_path' not in result: result['weights_path'] = p_val
+                elif 'grounding' in t_val or 'grounding' in vn_val:
+                    if 'weight' in vn_val and 'weights_path' not in result: 
+                        result['weights_path'] = p_val
+                        result['is_grounding_dino'] = True
                 elif 'sam' in t_val:
                     if ('config' in vn_val or 'cfg' in vn_val) and 'sam_config' not in result: result['sam_config'] = p_val
                     if ('weight' in vn_val or 'checkpoint' in vn_val or 'pth' in vn_val) and 'sam_weights' not in result: result['sam_weights'] = p_val
@@ -408,7 +412,7 @@ def run():
         return
 
     fms = fm_df[fm_col_name].dropna().astype(str).str.strip()
-    fms = fms[fms != ""]
+    fms = fms[(fms != "") & (fms.str.lower() != "nan") & (fms.str.lower() != "a")]
     unique_fms = fms.unique()
     print(f"DEBUG: Unique Failure Modes found: {list(unique_fms)}")
 
@@ -480,7 +484,12 @@ def run():
             # Fetch Failure Mode row to extract product and generation
             fm_row_for_context = fm_df[fm_df[fm_col_name] == fm].iloc[0] if not fm_df[fm_df[fm_col_name] == fm].empty else None
             strat_product = str(fm_row_for_context.get('Product', '')) if fm_row_for_context is not None else ''
-            strat_generation = str(fm_row_for_context.get('Generation', '')) if fm_row_for_context is not None else ''
+            
+            strat_gen_raw = fm_row_for_context.get('Generation', '') if fm_row_for_context is not None else ''
+            strat_generation = str(strat_gen_raw)
+            if strat_generation.endswith(".0"):
+                strat_generation = strat_generation[:-2]
+                
             strat_pic_path = str(fm_row_for_context.get('Pic_Path', '')) if fm_row_for_context is not None else ''
             
             # Override from command line if provided

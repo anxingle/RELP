@@ -54,7 +54,9 @@ class CanvasPrepareStrategy(AnalysisStrategy):
         print(">>> [Canvas Prepare Strategy] Models loaded.")
 
         input_path = Path(self.download_path)
-        output_base = Path(str(fm_row['Output_Path']) if fm_row is not None else "Result")
+        output_base_str = str(fm_row['Output_Path']).strip() if fm_row is not None and pd.notna(fm_row.get('Output_Path')) else "Result"
+        if output_base_str.lower() == 'nan': output_base_str = "Result"
+        output_base = Path(output_base_str)
         
         output_folder_name = f"{self.product}_{self.generation}_{fm}_Result"
         output_dir_base = output_base / output_folder_name

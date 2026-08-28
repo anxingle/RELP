@@ -159,6 +159,26 @@ class GeneralFmDispatcher(AnalysisStrategy):
         print(f"\n>>> [Dispatcher] Grouping complete. Formed {len(task_batches)} distinct sub-tasks.")
         from utils.core.strategies.strategy_factory import StrategyFactory
         
+        # [NEW] Ensure all children inherit the same base 'res_path' for their outputs
+        parent_res_path = self.res_path
+        if not parent_res_path:
+            # Reconstruct default Result path for K11p General (the dispatcher's FM)
+            fm_df = self.cm.get_sheet('Failure Mode')
+            fm_matches = fm_df[fm_df['Failure Mode'].astype(str).apply(_norm) == _norm(fm)]
+            output_path_type = 'Result'
+            if not fm_matches.empty and pd.notna(fm_matches.iloc[0].get('Output_Path')):
+                output_path_type = str(fm_matches.iloc[0]['Output_Path']).strip()
+                if output_path_type.lower() == 'nan':
+                    output_path_type = 'Result'
+                
+            if output_path_type == 'Result':
+                parent_res_path = os.path.join(project_root, 'Result', f"{self.product}_{self.generation}_{fm}_{fm}_Result")
+            else:
+                parent_res_path = os.path.join(output_path_type, f"{self.product}_{self.generation}_{fm}_{fm}_Result")
+            
+            if not os.path.isabs(parent_res_path):
+                parent_res_path = os.path.join(project_root, parent_res_path)
+
         for task_key, batch_data in task_batches.items():
             dest_fm, config_group = task_key
             files_to_process = batch_data['files']
@@ -172,6 +192,7 @@ class GeneralFmDispatcher(AnalysisStrategy):
             print(f"  -> Target Config Group: {config_group}")
             print(f"  -> Images to process: {len(files_to_process)}")
             print(f"  -> Embedded Rules: {rules}")
+            print(f"  -> Force Res Path: {parent_res_path}")
             
             # 找到目标 Flow 的 Defect Identification
             flow_matches = self.flow_df[
@@ -197,6 +218,7 @@ class GeneralFmDispatcher(AnalysisStrategy):
             # 构造子任务的 Context
             sub_context = self.context.copy()
             sub_context['fm'] = dest_fm
+            sub_context['res_path'] = parent_res_path # <--- OVERRIDE CHILD RES_PATH
             sub_context['config_group_override'] = config_group
             sub_context['file_list'] = files_to_process
             sub_context['general_fm_rules'] = rules # Inject the Scope & Defect Class rules!

@@ -1,0 +1,93 @@
+{
+    "version": "1.0",
+    "name": "Textile_R692_bubble",
+    "trigger_condition": {
+        "Failure Mode": "bubble",
+        "Product": "Macbook",
+        "Generation": "K11p"
+    },
+    "pipeline": [
+        {
+            "id": "node_gdino_1",
+            "type": "GroundingDINO",
+            "params": {
+                "prompt": "elliptic object.",
+                "box_threshold": 0.25,
+                "text_threshold": 0.25,
+                "aspect_ratio": 1.3
+            },
+            "inputs": {
+                "image": "raw_image"
+            }
+        },
+        {
+            "id": "node_sam_1",
+            "type": "SAM2",
+            "params": {},
+            "inputs": {
+                "image": "raw_image",
+                "boxes": "node_gdino_1.boxes"
+            }
+        },
+        {
+            "id": "node_slicing_1",
+            "type": "Filtering",
+            "params": {
+                "method": "Slicing",
+                "method_setting": "Y[0.38:1.0]"
+            },
+            "inputs": {
+                "image": "raw_image",
+                "mask": "node_sam_1.mask",
+                "contour": "node_sam_1.mask"
+            }
+        },
+        {
+            "id": "node_gdino_tag",
+            "type": "GroundingDINO",
+            "params": {
+                "prompt": "red tag.",
+                "box_threshold": 0.1,
+                "text_threshold": 0.1
+            },
+            "inputs": {
+                "image": "raw_image"
+            }
+        },
+        {
+            "id": "node_dino_1",
+            "type": "DINOv3",
+            "params": {
+                "dino_input_dim": [1280, 1280],
+                "transparency_threshold": 0.5,
+                "contour_shrink_ratio": 1.0,
+                "super_resolution_factor": 1.0
+            },
+            "inputs": {
+                "image": "raw_image",
+                "contour": "node_slicing_1.mask"
+            }
+        },
+        {
+            "id": "node_output_1",
+            "type": "ParametricOutput",
+            "params": {
+                "defect_class": "bubble",
+                "gray_scale_params": {
+                    "Enabled": true,
+                    "Mode": "Dino_Distance",
+                    "Invert": "No",
+                    "Bining": "[0.01-0.5, step =0.05]"
+                }
+            },
+            "inputs": {
+                "original_img": "raw_image",
+                "defect_mask": "node_dino_1.binary_mask",
+                "contour_mask": "node_slicing_1.mask",
+                "reference_boxes": "node_gdino_tag.boxes",
+                "reference_labels": "node_gdino_tag.labels",
+                "reference_scores": "node_gdino_tag.scores"
+            }
+        }
+    ]
+}

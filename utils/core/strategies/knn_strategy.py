@@ -92,11 +92,16 @@ class KnnStrategy(AnalysisStrategy):
                 print(f"Warning: Failed to load SAM2 Predictor: {e}")
                 
         # 4. 解析结果路径
-        output_path_type = str(fm_row['Output_Path']) if fm_row is not None else 'Result'
-        if output_path_type == 'Result' or pd.isna(output_path_type):
-            res_path = os.path.join(project_root, 'Result', f"{self.product}_{self.generation}_{fm}_{fm}_Result")
+        if self.context.get('res_path'):
+            res_path = self.context.get('res_path')
         else:
-            res_path = os.path.join(output_path_type, f"{self.product}_{self.generation}_{fm}_{fm}_Result")
+            output_path_type = str(fm_row['Output_Path']).strip() if fm_row is not None and pd.notna(fm_row.get('Output_Path')) else 'Result'
+            if output_path_type.lower() == 'nan': output_path_type = 'Result'
+            
+            if output_path_type == 'Result':
+                res_path = os.path.join(project_root, 'Result', f"{self.product}_{self.generation}_{fm}_{fm}_Result")
+            else:
+                res_path = os.path.join(output_path_type, f"{self.product}_{self.generation}_{fm}_{fm}_Result")
             
         if not os.path.exists(res_path):
             os.makedirs(res_path)
@@ -145,6 +150,19 @@ class KnnStrategy(AnalysisStrategy):
             for file in valid_files:
                 img_path = os.path.join(root, file)
                 print(f"\n{'='*50}\n>>> [Strategy KNN] Processing {file} ...\n{'='*50}")
+                
+                # --- Handle Relative Path ---
+                rel_path = os.path.relpath(root, self.download_path)
+                if rel_path == '.': rel_path = ''
+                
+                curr_debug_dir = os.path.join(self.debug_dir, rel_path)
+                if is_debug_mode: os.makedirs(curr_debug_dir, exist_ok=True)
+                
+                curr_res_dir = os.path.join(self.res_path, rel_path)
+                
+                inferred_pic_dir = os.path.join(self.res_path, "Inferred Pic", rel_path)
+                os.makedirs(inferred_pic_dir, exist_ok=True)
+                # ---------------------------
                 
                 # 6.1: 抠图对齐 (如果配了 dut 模型)
                 if dut_predictor:
@@ -315,7 +333,7 @@ class KnnStrategy(AnalysisStrategy):
                     input_scaled_contour=scaled_contour,  # 传入轮廓点，而不是 mask 矩阵
                     contour_shrink_ratio=1.0,
                     height_lower_ratio=0.0,  # 设为 0，意味着从顶部开始扫描，不进行 Y 轴裁切
-                    output_dir=self.debug_dir if is_debug_mode else self.res_path, # 改为写入 reference/ 文件夹
+                    output_dir=curr_debug_dir if is_debug_mode else curr_res_dir, # 改为写入 reference/ 或 result/ 文件夹
                     image_name=filename_base,
                     resize_scale_1st=knn_resize_1st,
                     resize_scale_2nd=knn_resize_2nd,
@@ -363,7 +381,7 @@ class KnnStrategy(AnalysisStrategy):
                                 original_img=DUT_Corrected_RGB,
                                 operations=ops,
                                 filtering_df=f_df,
-                                save_dir=self.debug_dir if is_debug_mode else self.res_path,
+                                save_dir=curr_debug_dir if is_debug_mode else curr_res_dir,
                                 image_path=img_path,
                                 contour_image=Contour_Corrected,
                                 defect_id_method=self.fm,
@@ -385,15 +403,12 @@ class KnnStrategy(AnalysisStrategy):
                 filename_base = os.path.splitext(file)[0]
                 
                 # --- [新增] 创建 Inferred Pic 文件夹 ---
-                inferred_pic_dir = os.path.join(self.res_path, "Inferred Pic")
-                os.makedirs(inferred_pic_dir, exist_ok=True)
-                
                 overlay = cv_ops.create_overlay_image(DUT_Corrected, defect_mask_bin, color=(0, 0, 255), transparency=0.5)
                 out_path = os.path.join(inferred_pic_dir, f"{filename_base}_knn_overlay.jpg")
                 cv2.imwrite(out_path, overlay)
                 
                 if is_debug_mode:
-                    cv2.imwrite(os.path.join(self.debug_dir, f"{filename_base}_mask.jpg"), defect_mask_bin)
+                    cv2.imwrite(os.path.join(curr_debug_dir, f"{filename_base}_mask.jpg"), defect_mask_bin)
                     
                 # --- [新增] 收集 Parametric 数据 ---
                 contour_area_val = cv2.countNonZero(Contour_Corrected) if Contour_Corrected is not None else 1.0
@@ -426,7 +441,7 @@ class KnnStrategy(AnalysisStrategy):
                         
                     p_dict = {
                         'Filename': file,
-                        'Dir': self.download_path,
+                        'Dir': rel_path,
                         'Defect_Type': self.fm,
                         'Detected Defect': self.fm,
                         'Defect Pct': f"{round(defect_pct_val, 2)}%",
@@ -436,7 +451,8 @@ class KnnStrategy(AnalysisStrategy):
                     if str(self.defect_output_df).strip().lower() == 'combined' or str(getattr(self, 'defect_output_df', pd.DataFrame())).strip().lower() == 'combined' or True: # We just do it anyway and let format_parametric_output_df handle it or override it
                         try:
                             import numpy as np
-                            npy_path = os.path.join(self.res_path, f"{filename_base}_combined_final_mask.npy")
+                            os.makedirs(curr_res_dir, exist_ok=True)
+                            npy_path = os.path.join(curr_res_dir, f"{filename_base}_combined_final_mask.npy")
                             np.save(npy_path, defect_mask_bin)
                             print(f">>> [Strategy] Saved .npy mask to {npy_path}")
                             # 在 Combined 模式下，旧代码把这个文件的路径塞进了 Contour 列
@@ -462,7 +478,7 @@ class KnnStrategy(AnalysisStrategy):
                     parametric_results.append(p_dict)
                 except Exception as e:
                     print(f">>> [Strategy Error] Parametric calculation failed: {e}")
-                    parametric_results.append({'Filename': file, 'Defect_Type': self.fm})
+                    parametric_results.append({'Filename': file, 'Dir': rel_path, 'Defect_Type': self.fm})
                     
         # --- [新增] 生成 Excel 表格 ---
         if parametric_results:

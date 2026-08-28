@@ -27,6 +27,8 @@ class AnalysisStrategy(ABC):
             
             cfg_mgr = ConfigManager()
             output_df = cfg_mgr.get_sheet('Output')
+            if self.defect_output_df.empty:
+                self.defect_output_df = output_df
             
             # 初始化默认值防止报错
             utils_general.Output_Config = []
@@ -131,6 +133,13 @@ class AnalysisStrategy(ABC):
         if image is None:
             print(f">>> [Strategy] Failed to load image: {image_path}")
             return None, None, None, None
+
+        if dut_predictor is None:
+            print(f">>> [Strategy] No DUT Predictor found for {self.fm}. Bypassing alignment and using raw image as DUT.")
+            import numpy as np
+            h, w = image.shape[:2]
+            dummy_mask = np.ones((h, w), dtype=np.uint8) * 255
+            return image, image.copy(), dummy_mask, {}
 
         # 2 & 3. Align and crop using the shared tool
         # We fetch configurations like batch_alignment from context or fallback to True

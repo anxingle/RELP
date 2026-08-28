@@ -7,6 +7,7 @@ import pandas as pd
 import os
 from utils.config.config_manager import ConfigManager
 from utils.cv_ops import _save_images_for_operations, apply_hsv_filtering, apply_rgb_filtering
+from utils.advanced_operators import op_relative_slicing
 
 
 def parse_filtering_operations(params):
@@ -338,8 +339,8 @@ def apply_global_threshold_filtering(original_img, mask_filtered, gt_config, out
         else:
             mask_filtered_resized = mask_filtered
         
-        # Convert to Grayscale
-        img_gray = cv2.cvtColor(img_to_process, cv2.COLOR_RGB2GRAY)
+        # Convert to Grayscale (OpenCV natively uses BGR)
+        img_gray = cv2.cvtColor(img_to_process, cv2.COLOR_BGR2GRAY)
         
         # 2. Uniform Light (Illumination Correction)
         if uniform_light:
@@ -372,6 +373,11 @@ def apply_global_threshold_filtering(original_img, mask_filtered, gt_config, out
         _, binary = cv2.threshold(img_gray, threshold, 255, cv2.THRESH_BINARY)
         print(f"DEBUG: Applied Global Threshold: {threshold}")
         
+        # 6.5 Invert if requested
+        if gt_config.get('invert', False):
+            binary = cv2.bitwise_not(binary)
+            print(f"DEBUG: Applied Invert Mask")
+        
         # 7. Post-processing: Morphological Open (Remove Specks)
         if morph_open > 0:
             k_open = morph_open * 2 + 1
@@ -396,9 +402,6 @@ def apply_global_threshold_filtering(original_img, mask_filtered, gt_config, out
                     area = cv2.contourArea(c)
                     if area >= min_area:
                         # Check if this is a hole (child of another contour)
-                        # hierarchy: [Next, Previous, First_Child, Parent]
-                        # Parent = -1 means it's an external contour
-                        # Parent >= 0 means it's a hole inside another contour
                         parent_idx = hierarchy[0][i][3]
                         if parent_idx >= 0:
                             # This is a hole (internal contour)
@@ -409,39 +412,37 @@ def apply_global_threshold_filtering(original_img, mask_filtered, gt_config, out
                             cv2.drawContours(mask_clean, [c], -1, 255, -1)
                     else:
                         # Area too small - remove this contour
-                        # If it's a hole, fill it (make it solid)
-                        # If it's external, remove it
                         parent_idx = hierarchy[0][i][3]
                         if parent_idx >= 0:
                             # Small hole - fill it (make it part of parent)
                             cv2.drawContours(mask_clean, [c], -1, 255, -1)
-                        # else: small external contour - don't draw it (remains 0)
             binary = mask_clean
             print(f"DEBUG: Applied Min Area filter: {min_area}")
         
-        # Count pixels before intersection
-        pixels_before = np.count_nonzero(mask_filtered_resized) if mask_filtered_resized is not None else 0
         pixels_gt = np.count_nonzero(binary)
         
-        # Intersect with input mask if provided
-        if mask_filtered_resized is not None:
-            if mask_filtered_resized.dtype == bool:
-                mask_filtered_new = mask_filtered_resized & (binary > 0)
-            else:
-                mask_filtered_new = cv2.bitwise_and(mask_filtered_resized, binary)
+        # Resize back to original size FIRST (if scaled) to maintain pixel parity with GUI
+        if size_scale != 1.0:
+            h_orig, w_orig = original_img.shape[:2]
+            binary_full = cv2.resize(binary, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
         else:
-            mask_filtered_new = binary
+            binary_full = binary
+
+        # Count pixels before intersection
+        pixels_before = np.count_nonzero(mask_filtered) if mask_filtered is not None else 0
+        
+        # Intersect with original high-res input mask if provided
+        if mask_filtered is not None:
+            mask_u8_in = (mask_filtered.astype(np.uint8) * 255) if mask_filtered.dtype == bool else mask_filtered
+            mask_filtered_new = cv2.bitwise_and(mask_u8_in, binary_full)
+        else:
+            mask_filtered_new = binary_full
         
         pixels_after = np.count_nonzero(mask_filtered_new)
         print(f"DEBUG: Global Threshold Intersection Result: Before={pixels_before} px, GT_Mask={pixels_gt} px, After={pixels_after} px")
         
-        # Resize back to original size if scaled
-        if size_scale != 1.0:
-            h_orig, w_orig = original_img.shape[:2]
-            mask_u8_res = (mask_filtered_new.astype(np.uint8) * 255) if mask_filtered_new.dtype == bool else mask_filtered_new
-            mask_filtered = cv2.resize(mask_u8_res, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
-        else:
-            mask_filtered = mask_filtered_new
+        # Re-assign back to mask_filtered for further processing
+        mask_filtered = mask_filtered_new
         
         # 10. ROI Shrink (Remove edge artifacts from Uniform Light)
         if roi_shrink < 1.0 and roi_shrink > 0:
@@ -732,7 +733,7 @@ def apply_filtering(mask_filtered, original_img, operations, filtering_df, save_
     extra_results = []
     
     if mask_filtered is None:
-        return None, extra_results
+        return None, extra_results, None, None, contour_image
     
     # --- NEW: Intersect with mask_default if provided ---
     # This ensures all filtering operations are constrained to the DUT region
@@ -749,7 +750,10 @@ def apply_filtering(mask_filtered, original_img, operations, filtering_df, save_
         else:
             mask_filtered_bool = mask_filtered
             
-        if mask_default_resized.dtype != bool:
+        if len(mask_default_resized.shape) == 3:
+            mask_default_gray = cv2.cvtColor(mask_default_resized, cv2.COLOR_BGR2GRAY)
+            mask_default_bool = mask_default_gray > 0
+        elif mask_default_resized.dtype != bool:
             mask_default_bool = mask_default_resized > 0
         else:
             mask_default_bool = mask_default_resized
@@ -1409,11 +1413,25 @@ def apply_filtering(mask_filtered, original_img, operations, filtering_df, save_
                         print(f"DEBUG: Detected simplified HSV format (without HSV= prefix)")
                         try:
                             # Extract HSV values using regex
-                            hsv_match = re.search(r'\(\s*(\d+)\s*,\s*(\d+)\s*\).*\(\s*(\d+)\s*,\s*(\d+)\s*\).*\(\s*(\d+)\s*,\s*(\d+)\s*\)', config_str)
-                            if hsv_match:
-                                h_min, h_max, s_min, s_max, v_min, v_max = hsv_match.groups()
-                                hsv_config['ranges'] = ((int(h_min), int(h_max)), (int(s_min), int(s_max)), (int(v_min), int(v_max)))
-                                print(f"DEBUG: Parsed simplified HSV ranges: {hsv_config['ranges']}")
+                            # Handle potential multiple ranges separated by &&
+                            if '&&' in config_str:
+                                parts = config_str.split('&&')
+                                parsed_ranges = []
+                                for p in parts:
+                                    hsv_match = re.search(r'\(\s*(\d+)\s*,\s*(\d+)\s*\).*\(\s*(\d+)\s*,\s*(\d+)\s*\).*\(\s*(\d+)\s*,\s*(\d+)\s*\)', p)
+                                    if hsv_match:
+                                        h_min, h_max, s_min, s_max, v_min, v_max = hsv_match.groups()
+                                        parsed_ranges.append(((int(h_min), int(h_max)), (int(s_min), int(s_max)), (int(v_min), int(v_max))))
+                                if parsed_ranges:
+                                    hsv_config['ranges'] = parsed_ranges
+                                    print(f"DEBUG: Parsed MULTIPLE simplified HSV ranges: {hsv_config['ranges']}")
+                            else:
+                                hsv_match = re.search(r'\(\s*(\d+)\s*,\s*(\d+)\s*\).*\(\s*(\d+)\s*,\s*(\d+)\s*\).*\(\s*(\d+)\s*,\s*(\d+)\s*\)', config_str)
+                                if hsv_match:
+                                    h_min, h_max, s_min, s_max, v_min, v_max = hsv_match.groups()
+                                    hsv_config['ranges'] = ((int(h_min), int(h_max)), (int(s_min), int(s_max)), (int(v_min), int(v_max)))
+                                    print(f"DEBUG: Parsed simplified HSV ranges: {hsv_config['ranges']}")
+                            
                             
                             # Extract Size parameter
                             size_match = re.search(r'Size\s*=\s*(\d+)\s*/\s*(\d+)', config_str, re.IGNORECASE)
@@ -1421,6 +1439,13 @@ def apply_filtering(mask_filtered, original_img, operations, filtering_df, save_
                                 num, den = size_match.groups()
                                 hsv_config['size'] = float(num) / float(den)
                                 print(f"DEBUG: Parsed Size from simplified format: {num}/{den} = {hsv_config['size']}")
+                                
+                            # Extract Invert parameter
+                            invert_match = re.search(r'Invert\s*=\s*(True|False|1|0|Yes|No)', config_str, re.IGNORECASE)
+                            if invert_match:
+                                val = invert_match.group(1).lower()
+                                hsv_config['invert'] = val in ('true', '1', 'yes')
+                                print(f"DEBUG: Parsed Invert from simplified format: {hsv_config['invert']}")
                         except Exception as e:
                             print(f"Warning: Failed to parse simplified HSV format: {e}")
                     
@@ -1495,6 +1520,9 @@ def apply_filtering(mask_filtered, original_img, operations, filtering_df, save_
                                         elif k_norm in ('denoise', 'blur', 'gaussian'):
                                             hsv_config['denoise'] = int(float(v_val))
                                             print(f"DEBUG: Parsed 'Denoise={v_val}' as Denoise: {int(float(v_val))}")
+                                        elif k_norm in ('invert', 'reverse'):
+                                            hsv_config['invert'] = v_val.lower() in ('on', 'true', '1', 'yes')
+                                            print(f"DEBUG: Parsed 'Invert={v_val}' as Invert: {hsv_config['invert']}")
                                         elif k_norm in ('roishrink', 'roi_shrink', 'shrink'):
                                             hsv_config['roi_shrink'] = float(v_val)
                                             print(f"DEBUG: Parsed 'ROI Shrink={v_val}' as ROI Shrink: {float(v_val)}")
@@ -1511,8 +1539,24 @@ def apply_filtering(mask_filtered, original_img, operations, filtering_df, save_
                 # Capture mask before HSV to compute removed pixels
                 mask_before_hsv = mask_filtered.copy() if mask_filtered is not None else None
                 
+                # --- HSV MUST PROCESS ON THE ORIGINAL IMAGE ---
+                # Do NOT pre-mask with black background to avoid edge bleeding during blur/resize.
+                # The intersection with the Band-ROI mask happens INSIDE apply_hsv_filtering at the end.
+                
+                # If user wants a debug visualization of the ROI, we can save a red overlay on the original image
+                if save_dir:
+                    fname = os.path.basename(image_path)
+                    fname_clean = os.path.splitext(fname)[0]
+                    debug_path = os.path.join(save_dir, f"{fname_clean}_HSV_INPUT_ROI_DEBUG.jpg")
+                    vis_img = original_img.copy()
+                    if mask_filtered is not None:
+                        # OpenCV reads in BGR. So [0, 0, 255] is pure Red.
+                        vis_img[mask_filtered > 0] = [0, 0, 255] 
+                    # Do NOT convert to BGR again, because original_img is already BGR!
+                    cv2.imwrite(debug_path, vis_img)
+                
                 mask_filtered, new_paths = apply_hsv_filtering(
-                    original_img, mask_filtered, hsv_config, out_params, save_dir, image_path, contour_image
+                    cv2.bitwise_and(original_img, original_img, mask=mask_filtered) if mask_filtered is not None else original_img, mask_filtered, hsv_config, out_params, save_dir, image_path, contour_image
                 )
                 
                 # Apply Min Area filtering if specified
@@ -1865,133 +1909,89 @@ def apply_filtering(mask_filtered, original_img, operations, filtering_df, save_
                 if (config_str is None or str(config_str).strip() == '') and area_val_col:
                     config_str = matched_row.get(area_val_col)
                     print(f"DEBUG: Slicing - Trying area_val_col '{area_val_col}': {config_str}")
+                    
+            if (not locals().get('config_str') or str(locals().get('config_str')).strip() == '') and out_params:
+                config_str = ",".join([f"{p['name']}[{','.join(p.get('params', []))}]" for p in out_params])
+                print(f"DEBUG: Slicing - Extracted config from node parameters: {config_str}")
                 
-                if config_str:
-                    try:
-                        s = str(config_str).strip()
-                        # Remove outer brackets if present (e.g., [X[0:0.1]] -> X[0:0.1])
-                        # Only remove one layer of brackets from start and end
-                        if s.startswith('[') and s.endswith(']'):
-                            s = s[1:-1]
+            if locals().get('config_str'):
+                try:
+                    s = str(locals().get('config_str')).strip()
+                    # Remove outer brackets if present (e.g., [X[0:0.1]] -> X[0:0.1])
+                    if s.startswith('[') and s.endswith(']'):
+                        s = s[1:-1]
                         
-                        # Parse X and Y ranges
-                        # Format examples:
-                        # 1. X[0:0.1, 0.9:1]  or  X=0:0.1,0.9:1
-                        # 2. Y[0.2:0.8]  or  Y=0.2:0.8
-                        
-                        import re
-                        
-                        # Pattern 1: X[...] or Y[...]
-                        x_match = re.search(r'X\s*\[\s*([^\]]+)\s*\]', s, re.IGNORECASE)
-                        y_match = re.search(r'Y\s*\[\s*([^\]]+)\s*\]', s, re.IGNORECASE)
-                        
-                        # Pattern 2: X=... or Y=...
-                        if not x_match:
-                            x_match = re.search(r'X\s*=\s*([\d.:,\s]+?)(?:,|\s+Y\s*|$)', s, re.IGNORECASE)
-                        if not y_match:
-                            y_match = re.search(r'Y\s*=\s*([\d.:,\s]+?)(?:,|$)', s, re.IGNORECASE)
-                        
-                        def parse_ranges(match_str):
-                            """Parse range string like '0:0.1, 0.9:1' into list of tuples"""
-                            ranges = []
-                            if match_str:
-                                parts = match_str.replace(' ', '').split(',')
-                                for part in parts:
-                                    if ':' in part:
-                                        try:
-                                            min_val, max_val = part.split(':')
-                                            ranges.append((float(min_val), float(max_val)))
-                                        except ValueError:
-                                            pass
-                            return ranges
-                        
-                        if x_match:
-                            x_ranges_str = x_match.group(1)
-                            slicing_config['x_ranges'] = parse_ranges(x_ranges_str)
-                            print(f"DEBUG: Slicing - Parsed X ranges: {slicing_config['x_ranges']}")
-                        
-                        if y_match:
-                            y_ranges_str = y_match.group(1)
-                            slicing_config['y_ranges'] = parse_ranges(y_ranges_str)
-                            print(f"DEBUG: Slicing - Parsed Y ranges: {slicing_config['y_ranges']}")
-                        
-                        print(f"DEBUG: Parsed Slicing Config: {slicing_config}")
-                    except Exception as e:
+                    # Parse X and Y ranges
+                    # Format examples:
+                    # 1. X[0:0.1, 0.9:1]  or  X=0:0.1,0.9:1
+                    # 2. Y[0.2:0.8]  or  Y=0.2:0.8
+                    
+                    import re
+                    
+                    # Pattern 1: X[...] or Y[...]
+                    x_match = re.search(r'X\s*\[\s*([^\]]+)\s*\]', s, re.IGNORECASE)
+                    y_match = re.search(r'Y\s*\[\s*([^\]]+)\s*\]', s, re.IGNORECASE)
+                    
+                    # Pattern 2: X=... or Y=...
+                    if not x_match:
+                        x_match = re.search(r'X\s*=\s*([\d.:,\s]+?)(?:,|\s+Y\s*|$)', s, re.IGNORECASE)
+                    if not y_match:
+                        y_match = re.search(r'Y\s*=\s*([\d.:,\s]+?)(?:,|$)', s, re.IGNORECASE)
+                    
+                    def parse_ranges(match_str):
+                        """Parse range string like '0:0.1, 0.9:1' into list of tuples"""
+                        ranges = []
+                        if match_str:
+                            parts = match_str.replace(' ', '').split(',')
+                            for part in parts:
+                                if ':' in part:
+                                    try:
+                                        min_val, max_val = part.split(':')
+                                        ranges.append((float(min_val), float(max_val)))
+                                    except ValueError:
+                                        pass
+                        return ranges
+                    
+                    if x_match:
+                        x_ranges_str = x_match.group(1)
+                        slicing_config['x_ranges'] = parse_ranges(x_ranges_str)
+                        print(f"DEBUG: Slicing - Parsed X ranges: {slicing_config['x_ranges']}")
+                    
+                    if y_match:
+                        y_ranges_str = y_match.group(1)
+                        slicing_config['y_ranges'] = parse_ranges(y_ranges_str)
+                        print(f"DEBUG: Slicing - Parsed Y ranges: {slicing_config['y_ranges']}")
+                    
+                    print(f"DEBUG: Parsed Slicing Config: {slicing_config}")
+                except Exception as e:
                         print(f"Warning: Failed to parse Slicing config string '{config_str}': {e}")
                         import traceback
                         traceback.print_exc()
-            
+
             # Apply Slicing
             if mask_filtered is not None and (slicing_config['x_ranges'] or slicing_config['y_ranges']):
-                print(f"DEBUG: Applying Slicing...")
+                print(f"DEBUG: Applying Slicing via atomic operator...")
 
-                h, w = mask_filtered.shape[:2]
                 mask_u8 = (mask_filtered.astype(np.uint8) * 255) if mask_filtered.dtype == bool else mask_filtered
+                pixels_before = np.sum(mask_u8 > 0)
+                contour_pixels_before = np.count_nonzero(contour_image) if contour_image is not None else 0
 
-                # Create masks for X and Y ranges separately
-                mask_x = np.zeros_like(mask_u8)
-                mask_y = np.zeros_like(mask_u8)
+                # 调用提取出的底层数学原子算子
+                mask_filtered, contour_image = op_relative_slicing(
+                    target_mask=mask_filtered,
+                    x_ranges=slicing_config['x_ranges'],
+                    y_ranges=slicing_config['y_ranges'],
+                    reference_contour=contour_image
+                )
 
-                # Apply X ranges (column-based slicing)
-                if slicing_config['x_ranges']:
-                    for min_ratio, max_ratio in slicing_config['x_ranges']:
-                        x_start = int(w * min_ratio)
-                        x_end = int(w * max_ratio)
-                        mask_x[:, x_start:x_end] = 255
-                        print(f"DEBUG: Slicing - X range [{x_start}:{x_end}] ({min_ratio:.2f}:{max_ratio:.2f})")
-
-                # Apply Y ranges (row-based slicing)
-                if slicing_config['y_ranges']:
-                    for min_ratio, max_ratio in slicing_config['y_ranges']:
-                        y_start = int(h * min_ratio)
-                        y_end = int(h * max_ratio)
-                        mask_y[y_start:y_end, :] = 255
-                        print(f"DEBUG: Slicing - Y range [{y_start}:{y_end}] ({min_ratio:.2f}:{max_ratio:.2f})")
-
-                # Combine X and Y masks: intersection if both specified, union if only one
-                if slicing_config['x_ranges'] and slicing_config['y_ranges']:
-                    # Both X and Y specified: use intersection (AND)
-                    mask_keep = cv2.bitwise_and(mask_x, mask_y)
-                    print(f"DEBUG: Slicing - Using INTERSECTION of X and Y ranges")
-                elif slicing_config['x_ranges']:
-                    # Only X specified
-                    mask_keep = mask_x
-                else:
-                    # Only Y specified
-                    mask_keep = mask_y
-
-                # Apply the mask (keep only pixels that are in the mask and in the keep region)
-                mask_filtered = cv2.bitwise_and(mask_u8, mask_keep)
-
-                # Also apply slicing to contour_image if available
-                # This allows Defect Pct calculation to use sliced contour area
+                mask_u8_after = (mask_filtered.astype(np.uint8) * 255) if mask_filtered.dtype == bool else mask_filtered
+                pixels_after = np.sum(mask_u8_after > 0)
+                
+                print(f"DEBUG: Slicing applied. Mask pixels before: {pixels_before}, after: {pixels_after}")
+                
                 if contour_image is not None:
-                    # Ensure contour_image is uint8
-                    if contour_image.dtype == bool:
-                        contour_u8 = (contour_image.astype(np.uint8) * 255)
-                    else:
-                        contour_u8 = contour_image
-                    
-                    # Resize mask_keep to match contour_image if needed
-                    if mask_keep.shape[:2] != contour_u8.shape[:2]:
-                        mask_keep_resized = cv2.resize(mask_keep, (contour_u8.shape[1], contour_u8.shape[0]), interpolation=cv2.INTER_NEAREST)
-                    else:
-                        mask_keep_resized = mask_keep
-                    
-                    # Apply slicing to contour
-                    contour_sliced = cv2.bitwise_and(contour_u8, mask_keep_resized)
-                    
-                    # Update contour_image (preserve original dtype)
-                    if contour_image.dtype == bool:
-                        contour_image = contour_sliced > 127
-                    else:
-                        contour_image = contour_sliced
-                    
-                    contour_pixels_before = cv2.countNonZero(contour_u8) if contour_u8.dtype != bool else np.count_nonzero(contour_u8)
-                    contour_pixels_after = cv2.countNonZero(contour_sliced) if contour_sliced.dtype != bool else np.count_nonzero(contour_sliced)
+                    contour_pixels_after = np.count_nonzero(contour_image)
                     print(f"DEBUG: Slicing applied to contour. Contour pixels before: {contour_pixels_before}, after: {contour_pixels_after}")
-
-                print(f"DEBUG: Slicing applied. Mask pixels before: {np.sum(mask_u8 > 0)}, after: {np.sum(mask_filtered > 0)}")
             else:
                 if not slicing_config['x_ranges'] and not slicing_config['y_ranges']:
                     print(f"DEBUG: Slicing - No valid ranges found in config. Skipping.")
@@ -1999,6 +1999,7 @@ def apply_filtering(mask_filtered, original_img, operations, filtering_df, save_
                     print(f"DEBUG: Slicing - mask_filtered is None. Skipping.")
             
             save_with_counter(out_params, mask_filtered)
+
 
         # --- GLOBAL THRESHOLD FILTERING ---
         elif _norm(method) in ('globalthreshold', 'global_threshold', 'gt'):
@@ -2014,7 +2015,8 @@ def apply_filtering(mask_filtered, original_img, operations, filtering_df, save_
                 'morph_open': 0,
                 'morph_close': 0,
                 'min_area': 0,
-                'roi_shrink': 1.0
+                'roi_shrink': 1.0,
+                'invert': False
             }
             
             # Try to find config in filtering_df if method matches
@@ -2086,11 +2088,15 @@ def apply_filtering(mask_filtered, original_img, operations, filtering_df, save_
                                         gt_config['min_area'] = float(v_val)
                                     elif k_norm in ('roishrink', 'roi_shrink', 'shrink'):
                                         gt_config['roi_shrink'] = float(v_val)
+                                    elif k_norm in ('invert', 'invert_result'):
+                                        gt_config['invert'] = v_val.lower() in ('on', 'true', '1', 'yes')
                                 except ValueError:
                                     pass
                         print(f"DEBUG: Parsed Global Threshold Config from Sheet: {gt_config}")
                     except Exception as e:
                         print(f"Warning: Failed to parse Global Threshold config string '{config_str}': {e}")
+            else:
+                raise ValueError("Excel Error: Flow requires 'Global Threshold' but no matching configuration was found in the Global Threshold or Filtering sheet.")
             
             print(f"DEBUG: Applying Global Threshold Filtering...")
             
@@ -2100,7 +2106,7 @@ def apply_filtering(mask_filtered, original_img, operations, filtering_df, save_
             
             # Apply Global Threshold Filtering
             mask_filtered, gt_paths = apply_global_threshold_filtering(
-                masked_input_img, mask_filtered, gt_config, out_params, save_dir, image_path, contour_image
+                original_img, mask_filtered, gt_config, out_params, save_dir, image_path, contour_image
             )
             extra_results.extend(gt_paths)
             save_with_counter(out_params, mask_filtered)
@@ -2437,12 +2443,22 @@ def apply_filtering(mask_filtered, original_img, operations, filtering_df, save_
                                         v_val = s[i:end_quote]
                                         i = end_quote + 1
                                 else:
-                                    # Read until comma or end
-                                    end_pos = s.find(',', i)
-                                    if end_pos == -1:
-                                        end_pos = len(s)
-                                    v_val = s[i:end_pos].strip()
-                                    i = end_pos
+                                    # Look for comma, but not comma inside []
+                                    bracket_open = s.find('[', i)
+                                    comma_pos = s.find(',', i)
+                                    
+                                    if bracket_open != -1 and bracket_open < comma_pos:
+                                        # Value contains brackets, read until closing bracket and then next comma
+                                        bracket_close = s.find(']', bracket_open)
+                                        if bracket_close != -1:
+                                            comma_pos = s.find(',', bracket_close)
+                                            
+                                    if comma_pos == -1:
+                                        v_val = s[i:].strip()
+                                        i = len(s)
+                                    else:
+                                        v_val = s[i:comma_pos].strip()
+                                        i = comma_pos
                                 
                                 # Parse key-value pair
                                 k_norm = k.lower().replace('_', '').replace('-', '').replace(' ', '')
@@ -2520,17 +2536,24 @@ def apply_band_roi_filtering(original_img, mask_filtered, band_roi_config, out_p
     
     h, w = original_img.shape[:2]
     
-    # Convert to grayscale
-    if len(original_img.shape) == 3:
-        gray = cv2.cvtColor(original_img, cv2.COLOR_RGB2GRAY)
+    # === Use incoming mask_filtered (e.g. from SAM) as the base, rather than thresholding the raw image ===
+    if mask_filtered is not None and np.any(mask_filtered):
+        print("DEBUG: Band-ROI - Using incoming mask_filtered (from GroundingSAM/etc) as base contour.")
+        mask_base = mask_filtered.copy()
+        if mask_base.dtype != np.uint8:
+            mask_base = mask_base.astype(np.uint8)
+        # Ensure it's 255 for contour finding
+        mask_base[mask_base > 0] = 255
     else:
-        gray = original_img
+        # Fallback to legacy grayscale thresholding if no incoming mask
+        print("DEBUG: Band-ROI - No valid incoming mask. Falling back to grayscale thresholding.")
+        if len(original_img.shape) == 3:
+            gray = cv2.cvtColor(original_img, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = original_img
+        _, mask_base = cv2.threshold(gray, contour_th, 255, cv2.THRESH_BINARY)
     
-    # Find contours using grayscale thresholding (same as contour analysis.py)
-    # This finds the actual object (screen) rather than using the full image boundary
-    _, mask_base = cv2.threshold(gray, contour_th, 255, cv2.THRESH_BINARY)
-    
-    # Find contours in the thresholded mask
+    # Find contours in the base mask
     contours, _ = cv2.findContours(mask_base, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     print(f"DEBUG: Band-ROI - Found {len(contours)} contours after thresholding (threshold={contour_th})")
     
@@ -2582,12 +2605,44 @@ def apply_band_roi_filtering(original_img, mask_filtered, band_roi_config, out_p
     
     # Ring region = outer - inner
     ring_mask = cv2.subtract(mask_outer, mask_inner)
+    # Support inner rings if x_scale/y_scale < original
+    if x_scale < original_x_scale or y_scale < original_y_scale:
+        ring_mask = cv2.subtract(mask_inner, mask_outer)
+        print('DEBUG: Band-ROI - Inner ring detected (scale < original). Flipped subtraction.')
     
-    # Use entire ring region (no gray level filtering)
-    defect_mask = (ring_mask > 0)
-    defect_mask_u8 = defect_mask.astype(np.uint8) * 255
+    # Apply gray level threshold filtering within the ring if defect_th is > 0
+    if defect_th > 0:
+        if len(original_img.shape) == 3:
+            gray = cv2.cvtColor(original_img, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = original_img
+        _, thresh_mask = cv2.threshold(gray, defect_th, 255, cv2.THRESH_BINARY)
+        defect_mask_u8 = cv2.bitwise_and(ring_mask, thresh_mask)
+        defect_mask = (defect_mask_u8 > 0)
+
+    else:
+        # Use entire ring region
+        defect_mask = (ring_mask > 0)
+        defect_mask_u8 = defect_mask.astype(np.uint8) * 255
     
     # Count defect pixels
+
+    # --- NEW: Directional Crop ---
+    direction = band_roi_config.get('direction', 'all')
+    if direction == 'above_bottom':
+        print("DEBUG: Band-ROI - Keeping regions ABOVE the bottom edge (Top, Left, Right outer rings)")
+        bx, by, bbw, bbh = cv2.boundingRect(original_scaled_contour)
+        cutoff_y = by + bbh
+        defect_mask[cutoff_y:, :] = False
+        defect_mask_u8[cutoff_y:, :] = 0
+        ring_mask[cutoff_y:, :] = 0
+    elif direction == 'bottom':
+        print("DEBUG: Band-ROI - Cropping to BOTTOM region only")
+        bx, by, bbw, bbh = cv2.boundingRect(original_scaled_contour)
+        cutoff_y = by + bbh - 20
+        defect_mask[:cutoff_y, :] = False
+        defect_mask_u8[:cutoff_y, :] = 0
+        ring_mask[:cutoff_y, :] = 0
     defect_pixels = np.sum(defect_mask)
     ring_pixels = np.sum(ring_mask > 0)
     ratio = (defect_pixels / ring_pixels * 100) if ring_pixels > 0 else 0
@@ -2608,12 +2663,12 @@ def apply_band_roi_filtering(original_img, mask_filtered, band_roi_config, out_p
         cv2.drawContours(vis_img, [scaled_contour], -1, (0, 255, 0), 3)   # Green - after x_scale/y_scale
         
         # Highlight defect pixels
-        vis_img[defect_mask] = vis_img[defect_mask] * 0.5 + np.array([0, 0, 255]) * 0.5  # Semi-transparent red
+        vis_img[defect_mask] = vis_img[defect_mask] * 0.5 + np.array([255, 0, 0]) * 0.5  # Semi-transparent red
         
         # Save visualization
         base_name = os.path.splitext(os.path.basename(image_path))[0]
         vis_path = os.path.join(save_dir, f"{base_name}_band_roi_vis.png")
-        cv2.imwrite(vis_path, cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(vis_path, vis_img)
         print(f"DEBUG: Band-ROI - Saved visualization to {vis_path}")
         
         # Save defect mask
@@ -2643,21 +2698,16 @@ def apply_band_roi_filtering(original_img, mask_filtered, band_roi_config, out_p
         cv2.imwrite(banded_roi_path, cv2.cvtColor(banded_roi_img, cv2.COLOR_RGB2BGR))
         print(f"DEBUG: Band-ROI - Saved Banded_ROI.jpg to {banded_roi_path}")
     
-    # Return the defect mask combined with the input mask
-    # The result is the intersection of the input mask (mask_filtered) and the defect mask in ring region
-    # This ensures Band-ROI respects the input mask boundary (e.g., Contour_Corrected)
-    if mask_filtered is not None and mask_filtered.shape[:2] == defect_mask_u8.shape[:2]:
-        # Convert mask_filtered to uint8 if needed
-        if mask_filtered.dtype == bool:
-            mask_filtered_uint8 = (mask_filtered.astype(np.uint8) * 255)
-        else:
-            mask_filtered_uint8 = mask_filtered
-        result_mask = cv2.bitwise_and(mask_filtered_uint8, defect_mask_u8)
-        print(f"DEBUG: Band-ROI - Intersected with input mask. Result: {cv2.countNonZero(result_mask)} pixels")
+    # Return the ring mask directly.
+    # The actual defect detection inside the ring is typically handled by downstream nodes (like HSV)
+    # in the GUI pipeline. Band-ROI just defines the Region of Interest (the ring).
+    # If the user specified a defect_th, we can apply it, but typically we want to output the whole ring mask.
+    if defect_th > 0 and len(out_params) > 0 and 'Save' in str(out_params):
+         result_mask = defect_mask_u8
     else:
-        # Fallback: use defect_mask_u8 directly if input mask is not available or wrong size
-        result_mask = defect_mask_u8
-        print(f"DEBUG: Band-ROI - No valid input mask, using defect mask directly: {cv2.countNonZero(result_mask)} pixels")
+         result_mask = ring_mask
+         
+    print(f"DEBUG: Band-ROI - Returning outer ring mask directly: {cv2.countNonZero(result_mask)} pixels")
     
     return result_mask
 
@@ -2870,10 +2920,26 @@ def apply_stencil_roi_filtering(original_img, mask_filtered, stencil_roi_config,
     print(f"DEBUG: Stencil-ROI - DUT area: {dut_area:.1f}, Stencil area: {stencil_area:.1f}")
     
     # Create masks for DUT and Stencil
-    # Use original dut_contour for mask to align with visualization on original_img
     mask_dut = np.zeros((h, w), dtype=np.uint8)
     mask_stencil = np.zeros((h, w), dtype=np.uint8)
-    cv2.fillPoly(mask_dut, [dut_contour], 255)  # Use original contour
+    
+    dut_contour_for_mask = dut_contour
+    if original_x_scale != 1.0 or original_y_scale != 1.0:
+        dut_x, dut_y, dut_bw, dut_bh = cv2.boundingRect(dut_contour)
+        dut_cx = dut_x + dut_bw / 2
+        dut_cy = dut_y + dut_bh / 2
+        
+        scaled_dut = dut_contour.copy().astype(np.float32)
+        scaled_dut[:, 0, 0] = dut_cx + (scaled_dut[:, 0, 0] - dut_cx) * original_x_scale
+        scaled_dut[:, 0, 1] = dut_cy + (scaled_dut[:, 0, 1] - dut_cy) * original_y_scale
+        
+        scaled_dut[:, 0, 0] = np.clip(scaled_dut[:, 0, 0], 0, w - 1)
+        scaled_dut[:, 0, 1] = np.clip(scaled_dut[:, 0, 1], 0, h - 1)
+        
+        dut_contour_for_mask = scaled_dut.astype(np.int32)
+        print(f"DEBUG: Stencil-ROI - Applied original scaling to DUT mask: x={original_x_scale}, y={original_y_scale}")
+
+    cv2.fillPoly(mask_dut, [dut_contour_for_mask], 255)
     cv2.fillPoly(mask_stencil, [stencil_contour_final], 255)
     
     # Stencil ROI should NOT include DUT region
@@ -2889,14 +2955,10 @@ def apply_stencil_roi_filtering(original_img, mask_filtered, stencil_roi_config,
         print(f"DEBUG: Stencil-ROI - Stencil is INSIDE DUT. No valid ROI (empty mask returned)")
     
     # === Step 8: Combine with input mask ===
-    if mask_filtered is not None and mask_filtered.shape[:2] == ring_mask.shape[:2]:
-        if mask_filtered.dtype == bool:
-            mask_filtered_uint8 = (mask_filtered.astype(np.uint8) * 255)
-        else:
-            mask_filtered_uint8 = mask_filtered
-        result_mask = cv2.bitwise_and(mask_filtered_uint8, ring_mask)
-    else:
-        result_mask = ring_mask
+    # For Stencil-ROI, the ROI is usually defined as the area OUTSIDE the input mask (e.g. outer ring).
+    # If we bitwise_and it with the input mask, we'll get an empty mask (0 pixels).
+    # Therefore, Stencil-ROI replaces the current mask pipeline rather than intersecting with it.
+    result_mask = ring_mask
     
     # === Step 9: Save visualization if requested ===
     has_pic = any(str(p).strip().lower().startswith('pic') for p in out_params) if out_params else False
@@ -3278,8 +3340,13 @@ def apply_odbp_filtering(original_img, mask_filtered, odbp_config, out_params, s
     else:
         _, binary = cv2.threshold(res_diff, threshold, 255, cv2.THRESH_BINARY)
         print(f"DEBUG: ODBP - Applied threshold {threshold}")
+        
+    # --- Mask Intersection (CRITICAL FIX) ---
+    # We must restrict the resulting binary mask to ONLY the areas that were given in mask_filtered.
+    # Otherwise, inverted thresholding will convert all the black background into a giant defect!
+    binary = cv2.bitwise_and(binary, binary, mask=mask_u8)
     
-    print(f"DEBUG: ODBP - Non-zero pixels after threshold: {cv2.countNonZero(binary)}")
+    print(f"DEBUG: ODBP - Non-zero pixels after threshold and mask bounds: {cv2.countNonZero(binary)}")
     
     # --- Post-processing: Min Area Filter ---
     if min_area > 0:
@@ -3323,6 +3390,7 @@ def apply_odbp_filtering(original_img, mask_filtered, odbp_config, out_params, s
 
 
 def apply_adaptive_gaussian(original_img, mask_filtered, adaptive_gaussian_config, out_params, save_dir, image_path, contour_image=None):
+    import cv2
     """
     Applies Adaptive Gaussian Thresholding to the area defined by mask_filtered.
     contour_image: Optional mask of the DUT (DUT_Corrected) to exclude background noise.
@@ -3380,7 +3448,7 @@ def apply_adaptive_gaussian(original_img, mask_filtered, adaptive_gaussian_confi
             
             # --- NEW: Apply Size (resize) preprocessing ---
             img_processed = original_img.copy()
-            mask_processed = mask_filtered.copy()
+            mask_processed = mask_filtered.copy() if mask_filtered is not None else np.ones(img_processed.shape[:2], dtype=bool)
             
             resize_map = {
                 "original": 1.0,
@@ -3414,7 +3482,9 @@ def apply_adaptive_gaussian(original_img, mask_filtered, adaptive_gaussian_confi
                     x, y, w, h = cv2.boundingRect(cnt)
                     
                     # Add padding equal to half block size to ensure correct thresholding at boundaries
-                    pad = max(1, ag_block_size // 2)
+                    # FIX: Increased padding drastically to give the Gaussian kernel enough real image data around the ROI
+                    # This prevents the BORDER_REPLICATE behavior from creating fake edge thresholds
+                    pad = max(50, ag_block_size)
                     
                     # Calculate padded coordinates
                     x1 = max(0, x - pad)
@@ -3513,22 +3583,16 @@ def apply_adaptive_gaussian(original_img, mask_filtered, adaptive_gaussian_confi
             else:
                  print("DEBUG: No input ROIs found. Result empty.")
             
-            # --- Apply DUT Mask Constraint if provided ---
-            # Need to resize contour_image to match processed image size if scale was applied
-            contour_image_resized = contour_image
-            if contour_image is not None and scale != 1.0:
-                h_processed, w_processed = img_processed.shape[:2]
-                contour_image_resized = cv2.resize(contour_image, (w_processed, h_processed), interpolation=cv2.INTER_NEAREST)
-                print(f"DEBUG: Resized contour_image from {contour_image.shape[:2]} to {w_processed}x{h_processed}")
             
-            if contour_image_resized is not None:
-                print("DEBUG: Applying DUT Mask constraint to Adaptive Gaussian result.")
-                # Ensure contour_image matches mask shape
-                if contour_image_resized.shape[:2] == combined_mask.shape[:2]:
-                    dut_mask_bool = (contour_image_resized > 0)
-                    combined_mask = combined_mask & dut_mask_bool
-                else:
-                    print(f"Warning: DUT Mask shape {contour_image_resized.shape[:2]} mismatch with AG Mask {combined_mask.shape[:2]}. Skipping constraint.")
+            # --- Apply DUT Mask Constraint if provided ---
+            # DISABLED: This legacy constraint forces intersection with the INNER DUT,
+            # wiping out outer defects completely.
+            # if contour_image_resized is not None:
+            #    print("DEBUG: Applying DUT Mask constraint to Adaptive Gaussian result.")
+            #    if contour_image_resized.shape[:2] == combined_mask.shape[:2]:
+            #        dut_mask_bool = (contour_image_resized > 0)
+            #        combined_mask = combined_mask & dut_mask_bool
+
 
             # --- Resize mask back to original size if needed ---
             if scale != 1.0:
@@ -3896,15 +3960,18 @@ def load_and_filter_filtering_sheet(config_path, product, generation, failure_mo
                 target_config_group = _norm(config_group)
                 
                 # Match specific config_group or wildcard (all/general/nan/empty)
-                match_mask = (config_group_col_norm == target_config_group) | (config_group_col_norm == 'nan') | (config_group_col_norm == 'all') | (config_group_col_norm == 'general') | (config_group_col_norm == '')
-                temp_df_filtered = temp_df[match_mask]
+                exact_mask = (config_group_col_norm == target_config_group)
+                wildcard_mask = (config_group_col_norm == 'nan') | (config_group_col_norm == 'all') | (config_group_col_norm == 'general') | (config_group_col_norm == '')
+                
+                temp_df_filtered = temp_df[exact_mask | wildcard_mask]
                 
                 if temp_df_filtered.empty:
                     # OPTIMIZATION: If no match for specific config_group, fallback to 'Remaining'
                     if target_config_group != _norm('Remaining'):
                         if verbose:
                             print(f"DEBUG: Config_Group '{config_group}' not found. Falling back to 'Remaining'...")
-                        remaining_mask = (config_group_col_norm == _norm('Remaining')) | (config_group_col_norm == 'nan') | (config_group_col_norm == 'all') | (config_group_col_norm == 'general') | (config_group_col_norm == '')
+                        exact_remaining = (config_group_col_norm == _norm('Remaining'))
+                        remaining_mask = exact_remaining | wildcard_mask
                         temp_df = temp_df[remaining_mask]
                         remaining_fallback_triggered = True
                         if verbose:
@@ -3918,6 +3985,11 @@ def load_and_filter_filtering_sheet(config_path, product, generation, failure_mo
                         if verbose:
                             print(f"DEBUG: Config_Group Filter FAILED. No matches for '{target_config_group}' or wildcards.")
                 else:
+                    # IMPORTANT FIX: Sort so that exact Config_Group matches appear FIRST.
+                    # This ensures that when iloc[0] is taken, the specific rule overrides the generic wildcard rule.
+                    temp_df_filtered = temp_df_filtered.assign(_is_exact=exact_mask)
+                    temp_df_filtered = temp_df_filtered.sort_values(by='_is_exact', ascending=False)
+                    temp_df_filtered = temp_df_filtered.drop(columns=['_is_exact'])
                     temp_df = temp_df_filtered
                     if verbose:
                         print(f"DEBUG: After Config_Group filter: {len(temp_df)} rows")

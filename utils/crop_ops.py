@@ -749,9 +749,15 @@ def crop_and_resize(final_output, final_rotated_mask, padding=0, target_size=Non
     new_w, new_h = int(w * scale), int(h * scale)
     
     # 缩放图像
-    # [CRITICAL FIX] Restore exact Zee logic: Use INTER_LINEAR for resizing.
-    # The user explicitly confirmed the smoothness of Zee's output which uses the default cv2.resize (INTER_LINEAR).
-    resized_img = cv2.resize(cropped_image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    # [BUGFIX] MUST use INTER_LINEAR consistently to generate the smooth grey anti-aliasing edge
+    # INTER_AREA can sometimes create harsh artifacts if not aligned perfectly
+    interp_method = cv2.INTER_LINEAR
+    resized_img = cv2.resize(cropped_image, (new_w, new_h), interpolation=interp_method)
+    
+    # We DO NOT apply the resized_mask back onto the image!
+    # The mask was already applied tightly before resizing.
+    # If we apply a Nearest-Neighbor resized mask here, it will cut off the smooth 
+    # anti-aliased grey pixels created by INTER_AREA/INTER_LINEAR and create hard "狗牙" dog teeth.
     resized_mask = cv2.resize(cropped_mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
     
     # 创造绝对纯黑正方形
@@ -803,6 +809,18 @@ def perform_dut_alignment(image, dut_predictor, sam2_predictor,
         
         print(f"DEBUG: Running detect_bounding_boxes with threshold {thresh_val}")
         tape_boxes, tape_classes = detect_bounding_boxes(image, dut_predictor)
+        
+        # 对于贯穿全图的长条形 DUT（如表带），如果目标检测框几乎占满全图（宽度>70%），自动向两侧延伸至边缘 [0, W]
+        img_h, img_w = image.shape[:2]
+        adjusted_boxes = []
+        for b in tape_boxes:
+            b_box = list(b)
+            box_w = b_box[2] - b_box[0]
+            if box_w > 0.7 * img_w:
+                b_box[0] = 0.0
+                b_box[2] = float(img_w)
+            adjusted_boxes.append(b_box)
+        tape_boxes = np.array(adjusted_boxes) if len(adjusted_boxes) > 0 else tape_boxes
         
         if len(tape_boxes) == 0:
             print("Warning: No DUT boxes detected.")

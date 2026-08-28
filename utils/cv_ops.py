@@ -992,15 +992,17 @@ def extract_class_masks(image, detector, target_class_names, score_thresh=0.5):
 
 
 def generate_sam2_mask(sam2_predictor, image_rgb, box, mask_scaling_factor=1.0):
-    x1, y1, x2, y2 = map(int, box)
+    import math
+    x1, y1, x2, y2 = box
     
-    # Force padding to 0 to match cropping sample
+    # 彻底恢复 test_k11p 的原生 SAM 解析！
+    # 强制抛弃额外的 Padding。因为 test_k11p 是无 padding 切图，所以这里还原为绝对原汁原味
     padding = 0
     h, w = image_rgb.shape[:2]
-    x1 = max(0, x1 - padding)
-    y1 = max(0, y1 - padding)
-    x2 = min(w, x2 + padding)
-    y2 = min(h, y2 + padding)
+    x1 = max(0, int(x1) - padding)
+    y1 = max(0, int(y1) - padding)
+    x2 = min(w, int(x2) + padding)
+    y2 = min(h, int(y2) + padding)
     
     center = np.array([[(x1 + x2) / 2, (y1 + y2) / 2]])
     input_box = np.array([x1, y1, x2, y2])
@@ -1046,8 +1048,14 @@ def generate_sam2_mask(sam2_predictor, image_rgb, box, mask_scaling_factor=1.0):
     if not contours:
         return None
     largest_contour = max(contours, key=cv2.contourArea)
-    cv2.fillPoly(mask, [largest_contour], 255) 
-    mask_filled = mask
+    
+    # [BUGFIX] Must create a clean mask containing ONLY the largest contour!
+    # test_k11p script was operating on an image with only 1 instance so it didn't matter,
+    # but SAM sometimes predicts small disconnected noise blobs in the background. 
+    # If we don't erase them, the bounding box of the entire mask gets artificially inflated!
+    clean_mask = np.zeros_like(mask)
+    cv2.fillPoly(clean_mask, [largest_contour], 255) 
+    mask_filled = clean_mask
     
     # Apply Mask Scaling ONLY if explicitly requested (factor != 1.0)
     if mask_scaling_factor != 1.0:
@@ -1162,8 +1170,10 @@ def apply_rgb_filtering(original_img, mask_filtered, rgb_config_row, output_para
         print(f"DEBUG: Target RGB: {target_rgb} ({color_name}), Tol: {tolerance}, Prox: {proximity}")
 
         # Calculate Distance
-        # original_img is RGB
-        diff = original_img.astype(np.float32) - target_rgb.astype(np.float32)
+        # original_img is BGR (from cv2.imread), so we must flip target_rgb to BGR
+        target_bgr = target_rgb[::-1]
+        
+        diff = original_img.astype(np.float32) - target_bgr.astype(np.float32)
         dist = np.linalg.norm(diff, axis=2)
         
         # Create Valid Mask based on proximity
@@ -1256,6 +1266,7 @@ def apply_hsv_filtering(original_img, mask_filtered, hsv_config_row, output_para
         contrast = float(hsv_config_row.get('contrast', 1.0))
         denoise = int(hsv_config_row.get('denoise', 0))
         roi_shrink = float(hsv_config_row.get('roi_shrink', 1.0))
+        invert = hsv_config_row.get('invert', False)
         
         # Parse ranges if provided as string
         if isinstance(ranges, str):
@@ -1286,10 +1297,22 @@ def apply_hsv_filtering(original_img, mask_filtered, hsv_config_row, output_para
                 except Exception:
                     pass
         
-        if not isinstance(ranges, (list, tuple)) or len(ranges) != 3:
-            print(f"Warning: Invalid HSV ranges format: {ranges}. Skipping HSV filter.")
+        if not isinstance(ranges, (list, tuple)):
+            print(f"Warning: Invalid HSV ranges format (not list/tuple): {ranges}. Skipping HSV filter.")
             return mask_filtered, hsv_result_paths
         
+        # Determine if multiple sets or single set
+        is_multiple = False
+        if len(ranges) > 0 and isinstance(ranges[0], (list, tuple)) and len(ranges[0]) == 3:
+            # We have a list of sets of ranges e.g. [((H,H),(S,S),(V,V)), ((H,H),(S,S),(V,V))]
+            is_multiple = True
+            range_sets = ranges
+        elif len(ranges) == 3:
+            range_sets = [ranges]
+        else:
+            print(f"Warning: Invalid HSV ranges format (length check failed): {ranges}. Skipping HSV filter.")
+            return mask_filtered, hsv_result_paths
+
         # Clamp ranges to valid HSV bounds used in project (0-255 for each slider per GUI)
         def clamp_pair(pair, low=0, high=255):
             try:
@@ -1299,11 +1322,7 @@ def apply_hsv_filtering(original_img, mask_filtered, hsv_config_row, output_para
             a = max(low, min(high, a))
             b = max(low, min(high, b))
             return a, b
-        
-        h_min, h_max = clamp_pair(ranges[0])
-        s_min, s_max = clamp_pair(ranges[1])
-        v_min, v_max = clamp_pair(ranges[2])
-        
+
         # --- Pre-processing Pipeline ---
         
         # 1. Resize
@@ -1343,10 +1362,11 @@ def apply_hsv_filtering(original_img, mask_filtered, hsv_config_row, output_para
             print(f"DEBUG: Applied Denoise (Gaussian Blur): kernel size {ksize}")
 
         # Convert to HSV
-        # Note: img_to_process is RGB format (from RELP3_main), but CV_GUI uses BGR
-        # We need to convert RGB to BGR first, then to HSV to match CV_GUI behavior
-        img_bgr = cv2.cvtColor(img_to_process, cv2.COLOR_RGB2BGR)
-        img_hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+        # Convert to HSV
+        # If the input image is already BGR (like from cv2.imread), we can directly convert to HSV.
+        # But if it's RGB, we should convert RGB->BGR->HSV.
+        # By default, cv2.imread returns BGR.
+        img_hsv = cv2.cvtColor(img_to_process, cv2.COLOR_BGR2HSV)
         
         # 4. Uniform Light (Illumination Correction)
         if uniform_light:
@@ -1369,23 +1389,26 @@ def apply_hsv_filtering(original_img, mask_filtered, hsv_config_row, output_para
             img_hsv = cv2.merge([h_ch, s_corr, v_corr])
             print(f"DEBUG: Applied Uniform Light Correction (Kernel: {k_illum})")
 
-        lower = np.array([h_min, s_min, v_min], dtype=np.uint8)
-        upper = np.array([h_max, s_max, v_max], dtype=np.uint8)
+        hsv_mask = np.zeros(img_hsv.shape[:2], dtype=np.uint8)
         
-        hsv_mask = cv2.inRange(img_hsv, lower, upper)  # uint8 [0,255]
+        for r_set in range_sets:
+            h_min, h_max = clamp_pair(r_set[0])
+            s_min, s_max = clamp_pair(r_set[1])
+            v_min, v_max = clamp_pair(r_set[2])
+            
+            lower = np.array([h_min, s_min, v_min], dtype=np.uint8)
+            upper = np.array([h_max, s_max, v_max], dtype=np.uint8)
+            
+            current_mask = cv2.inRange(img_hsv, lower, upper)  # uint8 [0,255]
+            hsv_mask = cv2.bitwise_or(hsv_mask, current_mask)
+        
+        if invert:
+            hsv_mask = cv2.bitwise_not(hsv_mask)
+            print("DEBUG: Applied Invert logic to HSV mask")
         
         # Refine mask_filtered by AND with hsv_mask
         # DEBUG: Save intermediate masks for verification
-        if save_dir:
-            try:
-                # Use os.path.splitext to handle filenames with dots (e.g., "0.08")
-                fname_clean_debug = os.path.splitext(os.path.basename(image_path))[0].replace('_rotated90_cropped', '').replace('_rotated90', '').replace('_cropped', '').replace('_Corrected', '')
-                if not os.path.exists(save_dir):
-                    os.makedirs(save_dir, exist_ok=True)
-                cv2.imwrite(os.path.join(save_dir, f"{fname_clean_debug}_debug_hsv_only_mask.png"), hsv_mask)
-                print(f"DEBUG: Saved intermediate HSV debug mask to {save_dir}")
-            except Exception as e:
-                print(f"Warning: Failed to save HSV debug masks: {e}")
+
 
         # Count pixels before (using resized mask if applicable)
         pixels_before = np.count_nonzero(mask_filtered_resized) if mask_filtered_resized is not None else 0

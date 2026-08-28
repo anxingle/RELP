@@ -17,7 +17,7 @@ class SAM2OnnxPredictor:
         if device == 'cuda':
             providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
         elif device == 'mps':
-            providers = ['CoreMLExecutionProvider', 'CPUExecutionProvider']
+            providers = ['CPUExecutionProvider'] # Force CPU even if MPS requested due to SAM2 limitations
 
         files = os.listdir(model_dir)
         enc_file = next((f for f in files if 'encoder' in f and f.endswith('.onnx')), None)
@@ -174,7 +174,7 @@ class SAM2OnnxPredictor:
             
         return np.array(final_masks), scores[0], None
 
-def init_sam2(config_path, checkpoint_path, device='mps'):
+def init_sam2(config_path, checkpoint_path, device='cpu'):
     try:
         if not checkpoint_path or not os.path.exists(checkpoint_path):
              print(f"Warning: SAM2 checkpoint not found at {checkpoint_path}")
@@ -210,7 +210,7 @@ def init_sam2(config_path, checkpoint_path, device='mps'):
         try:
             os.chdir(config_dir)
             from sam2.build_sam import build_sam2
-            sam2_model = build_sam2(config_name, checkpoint_path, device=device)
+            sam2_model = build_sam2(config_name, checkpoint_path, device='cpu')
             print("SAM2 model initialized.")
             return sam2_model
         finally:
