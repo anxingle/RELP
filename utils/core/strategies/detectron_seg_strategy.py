@@ -183,16 +183,34 @@ class DetectronSegStrategy(AnalysisStrategy):
                     masks_tensor = instances.pred_masks.cpu().numpy()
                     for m in masks_tensor:
                         defect_mask[m > 0] = 255
-                        
-                # --- 2. 检测 DUT (手机壳) BBox ---
+
+                # --- 2. 检测 DUT 及非检测区 (Sub-features / Keep-out Zones) ---
                 dut_outputs = dut_predictor(image)
                 dut_instances = dut_outputs["instances"]
                 dut_instances = dut_instances[dut_instances.scores >= 0.5]
-                
-                if len(dut_instances) == 0:
-                    print(f"     [Warning] No DUT found in {pic_file}")
-                    continue
-                    
+
+                # --- 通用排除逻辑：Class ID == 0 为 DUT 主体；Class ID != 0 为非检测排除区 ---
+                excluded_feature_boxes = []
+                if dut_instances.has("pred_classes"):
+                    classes_arr = dut_instances.pred_classes.cpu().numpy()
+                    boxes_arr = dut_instances.pred_boxes.tensor.cpu().numpy()
+
+                    # 收集所有非检测区 (Class ID != 0) 并从当前初始 defect_mask 中扣除置零
+                    for cls_id, box in zip(classes_arr, boxes_arr):
+                        if cls_id != 0:
+                            excluded_feature_boxes.append(box)
+                            x1, y1, x2, y2 = box.astype(int)
+                            defect_mask[max(0, y1):min(h, y2), max(0, x1):min(w, x2)] = 0
+
+                    if len(excluded_feature_boxes) > 0:
+                        print(
+                            f"     [Strategy] Mask Subtraction: cleared {len(excluded_feature_boxes)} excluded sub-features (Class ID != 0) from defect mask.")
+
+                    # 仅保留主待测物 (Class ID == 0) 用于后续的 SN 绑定与尺寸分析
+                    dut_instances = dut_instances[dut_instances.pred_classes == 0]
+                    print(
+                        f"     [Strategy] Filtered to primary DUTs (Class ID == 0): remaining {len(dut_instances)} instances.")
+
                 boxes = dut_instances.pred_boxes.tensor.cpu().numpy()
                 boxes_coords = boxes[:, :4]
                 
@@ -504,6 +522,11 @@ class DetectronSegStrategy(AnalysisStrategy):
                         global_parametric_results.append(p_dict)
 
                 # 7.2. 生成整图的红框展示图
+                # --- 终极防御：强制从最终渲染图 overall_BG 中抠掉排除区，杜绝 SAM2 细化时的误反弹 ---
+                for box in excluded_feature_boxes:
+                    x1, y1, x2, y2 = box.astype(int)
+                    overall_BG[max(0, y1):min(h, y2), max(0, x1):min(w, x2)] = 0
+
                 # 读取全局颜色配置
                 import utils.utils_general as utils_general
                 mask_color_cfg = getattr(utils_general, 'Mask_Color', None)
