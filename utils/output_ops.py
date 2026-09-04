@@ -2,10 +2,17 @@
 
 
 import os
+import re
 import pandas as pd
 import numpy as np
 from sklearn.cluster import KMeans
 import warnings
+
+def sort_columns_with_numbers(df):
+    columns = df.columns.tolist()
+    pattern = re.compile(r'(\d+)')
+    sorted_columns = sorted(columns, key=lambda x: tuple(map(int, pattern.findall(x))))
+    return df[sorted_columns]
 
 def _norm(s):
     """Normalize string for case-insensitive comparison."""
