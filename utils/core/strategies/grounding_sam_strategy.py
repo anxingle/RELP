@@ -10,6 +10,7 @@ from .base_strategy import AnalysisStrategy
 from utils.config.config_manager import ConfigManager
 from utils.wrappers.grounding_dino_wrapper import load_grounding_dino_model
 import utils.utils_general as ug
+import utils.dinov3_utils as dinov3_utils
 from core.pipeline import DefectDetectionPipeline
 
 class GroundingSamStrategy(AnalysisStrategy):
@@ -258,6 +259,12 @@ class GroundingSamStrategy(AnalysisStrategy):
                         
                     sam_mask_total[mask > 0] = 255
                 
+                # 输出 SAM 抠出的原图 (仅保留目标区域，其余全黑背景)
+                if debug_mode:
+                    sam_crop_display = np.zeros_like(image)
+                    sam_crop_display[sam_mask_total > 0] = image[sam_mask_total > 0]
+                    cv2.imwrite(os.path.join(reference_dir, f"{os.path.splitext(file)[0]}_crop.jpg"), sam_crop_display)
+
                 # 输出单独的 SAM Mask (带红框参照) - 移动到 reference 文件夹
                 if debug_mode:
                     sam_display = np.zeros_like(image)
@@ -283,36 +290,46 @@ class GroundingSamStrategy(AnalysisStrategy):
                             dino_contour_mask = sliced_mask
 
                     print(f"     [DINOv3] Running inference on SAM mask region...")
-                    import utils.dinov3_utils as dinov3_utils
                     dino_th_df = cfg_mgr.get_sheet('Dino_TH')
                     current_dino_threshold = 0.5
                     if not dino_th_df.empty:
                         th_row = dino_th_df[dino_th_df['Failure Mode'] == fm]
                         if not th_row.empty:
-                            try:
-                                current_dino_threshold = float(th_row.iloc[0].get('Threshold', 0.5))
-                            except: pass
+                            row_dict = th_row.iloc[0]
+                            # 兼容各种可能填写的列名: Dino_Low, Threshold, Dino Low, Low
+                            for candidate_col in ['Dino_Low', 'Threshold', 'Dino Low', 'Low', 'low']:
+                                if candidate_col in row_dict and pd.notna(row_dict[candidate_col]):
+                                    try:
+                                        current_dino_threshold = float(row_dict[candidate_col])
+                                        print(f"     [DINOv3] Successfully loaded threshold from column '{candidate_col}': {current_dino_threshold}")
+                                        break
+                                    except Exception:
+                                        pass
                             
                     dino_input_dim = flow_row.iloc[0].get('Dino_Input_Dim', None)
                             
-                    dino_result = dinov3_utils.process_single_image_pipeline(
-                        image_path=img_path,
-                        model=self.dino_model,
-                        upsampler=self.upsampler,
-                        device=torch.device(device_str),
-                        save_dir=reference_dir if debug_mode else res_path, 
-                        super_resolution_factor=1.0,
-                        contour_shrink_ratio=1.0,
-                        transparency_threshold=current_dino_threshold,
-                        flooding_enabled=False,
-                        flooding_rgb=None,
-                        filtering_df=current_filtering_df,
-                        adaptive_gaussian_config=None,
-                        dino_input_dim=dino_input_dim,
-                        contour_image=dino_contour_mask,  
-                        post_ops=[],
-                        inferred_pic_dir=inferred_pic_dir if debug_mode else res_path
-                    )
+                    dino_result = None
+                    try:
+                        dino_result = dinov3_utils.process_single_image_pipeline(
+                            image_path=img_path,
+                            model=self.dino_model,
+                            upsampler=self.upsampler,
+                            device=torch.device(device_str),
+                            save_dir=reference_dir if debug_mode else res_path, 
+                            super_resolution_factor=1.0,
+                            contour_shrink_ratio=1.0,
+                            transparency_threshold=current_dino_threshold,
+                            flooding_enabled=False,
+                            flooding_rgb=None,
+                            filtering_df=current_filtering_df,
+                            adaptive_gaussian_config=None,
+                            dino_input_dim=dino_input_dim,
+                            contour_image=dino_contour_mask,  
+                            post_ops=[],
+                            inferred_pic_dir=inferred_pic_dir if debug_mode else res_path
+                        )
+                    except Exception as e:
+                        print(f">>> [DINOv3 Error] Failed to process image {file}: {e}")
                     if dino_result and len(dino_result) >= 5:
                         base_defect_mask = dino_result[4] # binary mask
                     else:
@@ -335,19 +352,66 @@ class GroundingSamStrategy(AnalysisStrategy):
                     # === 真正的 Overlay 输出 (合并到原图上) ===
                     from utils.cv_ops import create_overlay_image
                     
-                    mask_color = getattr(ug, 'Mask_Color', None)
-                    if mask_color is not None:
-                        color_rgb = mask_color['rgb']
-                        # OpenCV is BGR
-                        color_bgr = (color_rgb[2], color_rgb[1], color_rgb[0])
-                        transparency = mask_color['transparency']
-                    else:
-                        color_bgr = (0, 0, 255) # default red
-                        transparency = 1.0 # default fully opaque
+                    # 检查是否有 DINO 生成的真实彩虹渐变热力图 (在 reference 目录下)
+                    dino_ref_overlay_path = os.path.join(reference_dir, f"{os.path.splitext(file)[0]}_overlay.png")
+                    dino_heatmap_loaded = None
+                    if os.path.exists(dino_ref_overlay_path):
+                        dino_heatmap_loaded = cv2.imread(dino_ref_overlay_path)
+                    
+                    if dino_heatmap_loaded is not None and sam_mask_total is not None and np.any(sam_mask_total):
+                        if dino_heatmap_loaded.shape[:2] != image.shape[:2]:
+                            dino_heatmap_loaded = cv2.resize(dino_heatmap_loaded, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_LINEAR)
                         
-                    if filtered_defect_mask is not None and np.any(filtered_defect_mask):
+                        overlay_display = image.copy()
+                        # 将目标区域（SAM Mask 内部）融合展示 DINO 彩虹渐变热力图
+                        sam_target_bool = sam_mask_total > 0
+                        overlay_display[sam_target_bool] = dino_heatmap_loaded[sam_target_bool]
+                        
+                        # 如果有检测到的缺陷，画出缺陷外轮廓线（黄色细线），既美观又清晰标明异常区域
+                        if filtered_defect_mask is not None and np.any(filtered_defect_mask):
+                            defect_mask_bin = (filtered_defect_mask > 0).astype(np.uint8) * 255
+                            contours, _ = cv2.findContours(defect_mask_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                            cv2.drawContours(overlay_display, contours, -1, (0, 255, 255), 2)
+                    elif filtered_defect_mask is not None and np.any(filtered_defect_mask):
+                        mask_color = getattr(ug, 'Mask_Color', None)
+                        if mask_color is not None:
+                            color_rgb = mask_color['rgb']
+                            color_bgr = (color_rgb[2], color_rgb[1], color_rgb[0])
+                            transparency = mask_color['transparency']
+                        else:
+                            color_bgr = (0, 0, 255) # default red
+                            transparency = 0.4 # 半透明，避免纯色死板涂抹
                         overlay_display = create_overlay_image(image, filtered_defect_mask, color=color_bgr, transparency=transparency)
-                        
+                    else:
+                        overlay_display = image.copy()
+
+                    if filtered_defect_mask is not None and np.any(filtered_defect_mask):
+                        # --- 生成精确的 Crop 异常距离 CSV (确保坐标系与 1280x1280 空间对齐) ---
+                        raw_csv_path = os.path.join(reference_dir, f"{os.path.splitext(file)[0]}_anomaly_distance_raw.csv")
+                        if os.path.exists(raw_csv_path):
+                            try:
+                                # 1. 提取当前 SAM 掩码的 BBox (即送入 DINO 时的裁剪 BBox)
+                                bx, by, bw, bh = cv2.boundingRect(sam_mask_total)
+                                if max(bw, bh) > 0:
+                                    defect_crop = filtered_defect_mask[by:by+bh, bx:bx+bw]
+                                    scale = 1280.0 / max(bw, bh)
+                                    new_w, new_h = int(bw * scale), int(bh * scale)
+                                    defect_resized = cv2.resize(defect_crop, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+                                    y_start = (1280 - new_h) // 2
+                                    x_start = (1280 - new_w) // 2
+                                    mask_1280 = np.zeros((1280, 1280), dtype=np.uint8)
+                                    mask_1280[y_start:y_start+new_h, x_start:x_start+new_w] = defect_resized
+                                    
+                                    # 读取原版 CSV 并通过 Mask 过滤，非缺陷区域全部置 0
+                                    raw_dist = np.loadtxt(raw_csv_path, delimiter=",")
+                                    crop_dist = np.where(mask_1280 > 0, raw_dist, 0.0)
+                                    
+                                    crop_csv_path = os.path.join(reference_dir, f"{os.path.splitext(file)[0]}_crop_anomaly_distance_raw.csv")
+                                    np.savetxt(crop_csv_path, crop_dist.astype(np.float32), fmt="%.6f", delimiter=",")
+                                    print(f"     [Result] Saved precise masked distance map to: {crop_csv_path}")
+                            except Exception as e:
+                                print(f"     [Warning] Failed to generate crop distance CSV: {e}")
+
                         # --- 生成 Parametric Output 数据 ---
                         try:
                             if not hasattr(self, 'defect_output_df'):

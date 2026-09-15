@@ -16,7 +16,8 @@ dinomaly_path = os.path.join(project_root, 'Dinomaly')
 if dinomaly_path not in sys.path:
     sys.path.append(dinomaly_path)
 
-from PIL import Image
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 from functools import partial
 from models.uad import ViTill
 from models.vision_transformer import Block as VitBlock, bMlp, LinearAttention2
