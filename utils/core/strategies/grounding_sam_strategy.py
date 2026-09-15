@@ -10,6 +10,7 @@ from .base_strategy import AnalysisStrategy
 from utils.config.config_manager import ConfigManager
 from utils.wrappers.grounding_dino_wrapper import load_grounding_dino_model
 import utils.utils_general as ug
+import utils.utils_general as utils_general
 import utils.dinov3_utils as dinov3_utils
 from core.pipeline import DefectDetectionPipeline
 
