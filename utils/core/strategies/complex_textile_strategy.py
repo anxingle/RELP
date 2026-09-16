@@ -239,18 +239,13 @@ class ComplexTextileStrategy(AnalysisStrategy):
                 print(f"     [Result] Case W/H Ratio = {ratio:.2f}. Identified as: {face_name}")
                 
                 # --- Step 2: Dynamic Slicing based on Face Type ---
-                slicing_param = "Y[0.4:1.0]" if is_cd_face else "Y[0.4:1.0]"
-                print(f">>> [Step 2] Applying specific Slicing config for {face_name}: {slicing_param}")
+                slicing_param = "Y[0.0:1.0]"
+                print(f">>> [Step 2] Applying full face (no truncation): {slicing_param}")
                 slicing_op = [{'name': 'Slicing', 'params': [{'name': 'Y', 'params': [slicing_param[2:-1]], 'combine_mode': None}], 'combine_mode': None}]
                 # --- DEBUG VISUALIZATION: Save the Slicing BBox ---
                 debug_slice_img = image.copy()
                 cv2.rectangle(debug_slice_img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 255), 6)
                 cv2.putText(debug_slice_img, f"Case BBox (Ratio {ratio:.2f})", (int(x1), int(max(40, y1-20))), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 255), 4)
-                # Draw the cut line
-                slice_ratio = float(slicing_param.split(':')[0][2:])
-                cut_y = int(y1 + box_h * slice_ratio)
-                cv2.line(debug_slice_img, (int(x1), cut_y), (int(x2), cut_y), (255, 0, 255), 8)
-                cv2.putText(debug_slice_img, f"Slice Line (Y {slice_ratio})", (int(x1), cut_y-20), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 0, 255), 4)
                 cv2.imwrite(os.path.join(reference_dir, f"{os.path.splitext(file)[0]}_00_debug_slicing_box.jpg"), debug_slice_img)
 
                 sliced_case_mask, _, _, _, _ = fo.apply_filtering(
@@ -335,8 +330,15 @@ class ComplexTextileStrategy(AnalysisStrategy):
                 if not dino_th_df.empty:
                     th_row = dino_th_df[dino_th_df['Failure Mode'] == fm]
                     if not th_row.empty:
-                        try: dino_threshold = float(th_row.iloc[0].get('Threshold', 0.0))
-                        except: pass
+                        row_dict = th_row.iloc[0]
+                        for candidate_col in ['Dino_Low', 'Threshold', 'Dino Low', 'Low', 'low']:
+                            if candidate_col in row_dict and pd.notna(row_dict[candidate_col]):
+                                try:
+                                    dino_threshold = float(row_dict[candidate_col])
+                                    print(f"     [DINOv3] Successfully loaded threshold from column '{candidate_col}': {dino_threshold}")
+                                    break
+                                except Exception:
+                                    pass
                 
                 # Fetch Dino_Input_Dim from Flow
                 flow_df = cfg_mgr.get_sheet('Flow')
@@ -485,6 +487,12 @@ class ComplexTextileStrategy(AnalysisStrategy):
                         mask_bool = sliced_case_mask > 0
                         # 将有效切片区域替换为对齐后的热力图
                         overlay_display[mask_bool] = perfect_heatmap_bgr[mask_bool]
+                        
+                        # 如果有检测到的缺陷，画出缺陷外轮廓线（黄色细线），既美观又清晰标明异常区域
+                        if final_defect_mask is not None and np.any(final_defect_mask):
+                            defect_mask_bin = (final_defect_mask > 0).astype(np.uint8) * 255
+                            contours_def, _ = cv2.findContours(defect_mask_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                            cv2.drawContours(overlay_display, contours_def, -1, (0, 255, 255), 2)
                     else:
                         print("     [Warning] Reference heatmap missing or shape mismatch. Falling back to simple overlay.")
                         from utils.cv_ops import create_overlay_image
