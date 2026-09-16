@@ -153,24 +153,23 @@ class ComplexTextileStrategy(AnalysisStrategy):
                 x2, y2 = x1 + box_w, y1 + box_h
                 ratio = box_w / box_h if box_h > 0 else 0
                 
-                # Dynamic Routing (Corrected threshold based on logic: AB~7, CD~4)
-                # User correction: < 5.5 is AB face, > 5.5 is CD face
-                is_cd_face = ratio > 5.5
+                # --- Step 1.5: 智能面判定 (优先级: 物理特征 > 几何长宽比) ---
+                # 真正的 CD 侧面长宽比非常大 (>= 7.0，实测在 9~10 之间)；
+                # 真正的顶底面 (AB/BC/AD) 长宽比则较小 (实测在 4.5 ~ 6.5 之间)。
+                # 若仅靠 5.5 硬截断极易因为拍摄倾角把底面 (如 5.64) 误判为 CD 面。
                 
-                if is_cd_face:
-                    face_name = "CD面 (带按钮)"
-                else:
-                    face_name = "A面 (无孔长直面)"
+                # 1. 优先通过语义特征检测充电孔 (Charging Hole)
+                # 只有长宽比不是极端细长的侧面 (< 7.5)，都优先检测是否存在充电孔
+                valid_holes = []
+                if ratio < 7.5:
                     print(">>> [Step 1.5] Checking for charging hole to determine B face...")
                     hole_results = gdino_predictor.predict(image, "charging hole.")
-                    valid_holes = []
                     
                     for res in hole_results:
                         hx1, hy1, hx2, hy2 = map(int, res['bbox'])
                         hcx, hcy = (hx1+hx2)/2, (hy1+hy2)/2
-                        # Check if the center of the charging hole is inside the DUT bbox
+                        # 检查孔中心是否在手机壳主体 BBox 内部
                         if x1 <= hcx <= x2 and y1 <= hcy <= y2:
-                            # Also check area ratio to avoid nested case bounding boxes
                             hole_w = hx2 - hx1
                             hole_h = hy2 - hy1
                             hole_area = hole_w * hole_h
@@ -178,63 +177,73 @@ class ComplexTextileStrategy(AnalysisStrategy):
                             if dut_area > 0:
                                 area_ratio = hole_area / dut_area
                                 print(f"     [Debug] Potential hole found. Area ratio to DUT: {area_ratio*100:.2f}%")
-                                if area_ratio < 0.2: # A charging hole shouldn't be larger than 20% of the case side
+                                if area_ratio < 0.2: # 充电孔通常小于外壳截面的 20%
                                     valid_holes.append((area_ratio, [hx1, hy1, hx2, hy2]))
                                 else:
                                     print(f"     [Warning] Dropped a false hole because it is too large ({area_ratio*100:.2f}% of DUT).")
-                            
-                    if valid_holes:
-                        face_name = "B面 (带充电孔)"
-                        print(f"     [Result] Found {len(valid_holes)} valid charging hole(s) within DUT bbox. Upgrading to: {face_name}")
+
+                # 2. 结合充电孔特征与几何长宽比综合裁决
+                if valid_holes:
+                    face_name = "B面 (带充电孔)"
+                    is_cd_face = False
+                elif ratio >= 7.0:
+                    face_name = "CD面 (带按钮)"
+                    is_cd_face = True
+                else:
+                    face_name = "A面 (无孔长直面)"
+                    is_cd_face = False
+
+                if valid_holes:
+                    print(f"     [Result] Found {len(valid_holes)} valid charging hole(s) within DUT bbox. Upgrading to: {face_name}")
+                    
+                    # Find the hole with the largest area
+                    valid_holes.sort(key=lambda x: x[0], reverse=True)
+                    largest_hole_box = valid_holes[0][1]
+                    smaller_holes = [x[1] for x in valid_holes[1:]]
+                    
+                    print(f"     [Result] Largest charging hole (Ratio: {valid_holes[0][0]*100:.2f}%) uses Color Distance. {len(smaller_holes)} smaller holes use standard SAM2.")
+                    
+                    sam2_predictor.set_image(image_rgb)
+                    final_hole_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+                    h_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+                    
+                    # 1. Process Largest Hole with SAM2 + Color Distance
+                    h_masks, _, _ = sam2_predictor.predict(box=np.array(largest_hole_box), multimask_output=False)
+                    cur_h_mask = (h_masks[0] > 0).astype(np.uint8) * 255 if len(h_masks[0].shape)==2 else (h_masks[0][0] > 0).astype(np.uint8) * 255
+                    cur_h_mask = cv2.resize(cur_h_mask, (img_w, img_h), interpolation=cv2.INTER_NEAREST)
+                    
+                    # Apply Color Distance masking strictly inside the largest hole area to isolate the metal part
+                    # RGB=[0,0,0], Prox=Near, Tolerance=52 based on user request
+                    target_bgr = np.array([0, 0, 0], dtype=np.float32)
+                    tolerance = 52.0
+                    diff = image.astype(np.float32) - target_bgr
+                    dist = np.linalg.norm(diff, axis=2)
+                    valid_metal_pixels = (dist <= tolerance)
+                    
+                    # The final carved out area is ONLY where SAM says it's a hole AND the color matches the metal tolerance
+                    metal_hole_mask = (cur_h_mask > 0) & valid_metal_pixels
+                    
+                    # Smooth and slightly dilate the hole mask to ensure edges are fully covered
+                    metal_hole_mask_uint8 = metal_hole_mask.astype(np.uint8) * 255
+                    metal_hole_mask_uint8 = cv2.morphologyEx(metal_hole_mask_uint8, cv2.MORPH_CLOSE, h_kernel)
+                    metal_hole_mask_uint8 = cv2.dilate(metal_hole_mask_uint8, h_kernel, iterations=2)
+                    
+                    final_hole_mask = cv2.bitwise_or(final_hole_mask, metal_hole_mask_uint8)
+                    
+                    # 2. Process Smaller Holes with standard SAM2
+                    for s_box in smaller_holes:
+                        s_masks, _, _ = sam2_predictor.predict(box=np.array(s_box), multimask_output=False)
+                        cur_s_mask = (s_masks[0] > 0).astype(np.uint8) * 255 if len(s_masks[0].shape)==2 else (s_masks[0][0] > 0).astype(np.uint8) * 255
+                        cur_s_mask = cv2.resize(cur_s_mask, (img_w, img_h), interpolation=cv2.INTER_NEAREST)
                         
-                        # Find the hole with the largest area
-                        valid_holes.sort(key=lambda x: x[0], reverse=True)
-                        largest_hole_box = valid_holes[0][1]
-                        smaller_holes = [x[1] for x in valid_holes[1:]]
+                        cur_s_mask = cv2.morphologyEx(cur_s_mask, cv2.MORPH_CLOSE, h_kernel)
+                        cur_s_mask = cv2.dilate(cur_s_mask, h_kernel, iterations=2)
                         
-                        print(f"     [Result] Largest charging hole (Ratio: {valid_holes[0][0]*100:.2f}%) uses Color Distance. {len(smaller_holes)} smaller holes use standard SAM2.")
-                        
-                        sam2_predictor.set_image(image_rgb)
-                        final_hole_mask = np.zeros((img_h, img_w), dtype=np.uint8)
-                        h_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-                        
-                        # 1. Process Largest Hole with SAM2 + Color Distance
-                        h_masks, _, _ = sam2_predictor.predict(box=np.array(largest_hole_box), multimask_output=False)
-                        cur_h_mask = (h_masks[0] > 0).astype(np.uint8) * 255 if len(h_masks[0].shape)==2 else (h_masks[0][0] > 0).astype(np.uint8) * 255
-                        cur_h_mask = cv2.resize(cur_h_mask, (img_w, img_h), interpolation=cv2.INTER_NEAREST)
-                        
-                        # Apply Color Distance masking strictly inside the largest hole area to isolate the metal part
-                        # RGB=[0,0,0], Prox=Near, Tolerance=52 based on user request
-                        target_bgr = np.array([0, 0, 0], dtype=np.float32)
-                        tolerance = 52.0
-                        diff = image.astype(np.float32) - target_bgr
-                        dist = np.linalg.norm(diff, axis=2)
-                        valid_metal_pixels = (dist <= tolerance)
-                        
-                        # The final carved out area is ONLY where SAM says it's a hole AND the color matches the metal tolerance
-                        metal_hole_mask = (cur_h_mask > 0) & valid_metal_pixels
-                        
-                        # Smooth and slightly dilate the hole mask to ensure edges are fully covered
-                        metal_hole_mask_uint8 = metal_hole_mask.astype(np.uint8) * 255
-                        metal_hole_mask_uint8 = cv2.morphologyEx(metal_hole_mask_uint8, cv2.MORPH_CLOSE, h_kernel)
-                        metal_hole_mask_uint8 = cv2.dilate(metal_hole_mask_uint8, h_kernel, iterations=2)
-                        
-                        final_hole_mask = cv2.bitwise_or(final_hole_mask, metal_hole_mask_uint8)
-                        
-                        # 2. Process Smaller Holes with standard SAM2
-                        for s_box in smaller_holes:
-                            s_masks, _, _ = sam2_predictor.predict(box=np.array(s_box), multimask_output=False)
-                            cur_s_mask = (s_masks[0] > 0).astype(np.uint8) * 255 if len(s_masks[0].shape)==2 else (s_masks[0][0] > 0).astype(np.uint8) * 255
-                            cur_s_mask = cv2.resize(cur_s_mask, (img_w, img_h), interpolation=cv2.INTER_NEAREST)
-                            
-                            cur_s_mask = cv2.morphologyEx(cur_s_mask, cv2.MORPH_CLOSE, h_kernel)
-                            cur_s_mask = cv2.dilate(cur_s_mask, h_kernel, iterations=2)
-                            
-                            final_hole_mask = cv2.bitwise_or(final_hole_mask, cur_s_mask)
-                        
-                        # Mask out all holes from the main case_mask
-                        case_mask[final_hole_mask > 0] = 0
-                        print("     [Result] All charging hole features successfully carved out from Case Mask.")
+                        final_hole_mask = cv2.bitwise_or(final_hole_mask, cur_s_mask)
+                    
+                    # Mask out all holes from the main case_mask
+                    case_mask[final_hole_mask > 0] = 0
+                    print("     [Result] All charging hole features successfully carved out from Case Mask.")
 
                 print(f"     [Result] Case W/H Ratio = {ratio:.2f}. Identified as: {face_name}")
                 
