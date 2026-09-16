@@ -207,28 +207,15 @@ class ComplexTextileStrategy(AnalysisStrategy):
                     final_hole_mask = np.zeros((img_h, img_w), dtype=np.uint8)
                     h_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
                     
-                    # 1. Process Largest Hole with SAM2 + Color Distance
+                    # 1. Process Largest Hole with SAM2 (Directly carve out the full hole)
                     h_masks, _, _ = sam2_predictor.predict(box=np.array(largest_hole_box), multimask_output=False)
                     cur_h_mask = (h_masks[0] > 0).astype(np.uint8) * 255 if len(h_masks[0].shape)==2 else (h_masks[0][0] > 0).astype(np.uint8) * 255
                     cur_h_mask = cv2.resize(cur_h_mask, (img_w, img_h), interpolation=cv2.INTER_NEAREST)
                     
-                    # Apply Color Distance masking strictly inside the largest hole area to isolate the metal part
-                    # RGB=[0,0,0], Prox=Near, Tolerance=52 based on user request
-                    target_bgr = np.array([0, 0, 0], dtype=np.float32)
-                    tolerance = 52.0
-                    diff = image.astype(np.float32) - target_bgr
-                    dist = np.linalg.norm(diff, axis=2)
-                    valid_metal_pixels = (dist <= tolerance)
-                    
-                    # The final carved out area is ONLY where SAM says it's a hole AND the color matches the metal tolerance
-                    metal_hole_mask = (cur_h_mask > 0) & valid_metal_pixels
-                    
-                    # Smooth and slightly dilate the hole mask to ensure edges are fully covered
-                    metal_hole_mask_uint8 = metal_hole_mask.astype(np.uint8) * 255
-                    metal_hole_mask_uint8 = cv2.morphologyEx(metal_hole_mask_uint8, cv2.MORPH_CLOSE, h_kernel)
-                    metal_hole_mask_uint8 = cv2.dilate(metal_hole_mask_uint8, h_kernel, iterations=2)
-                    
-                    final_hole_mask = cv2.bitwise_or(final_hole_mask, metal_hole_mask_uint8)
+                    # 彻底镂空整个孔洞区域（膨胀2次以完全覆盖倒角边缘反光）
+                    cur_h_mask = cv2.morphologyEx(cur_h_mask, cv2.MORPH_CLOSE, h_kernel)
+                    cur_h_mask = cv2.dilate(cur_h_mask, h_kernel, iterations=2)
+                    final_hole_mask = cv2.bitwise_or(final_hole_mask, cur_h_mask)
                     
                     # 2. Process Smaller Holes with standard SAM2
                     for s_box in smaller_holes:
@@ -244,6 +231,18 @@ class ComplexTextileStrategy(AnalysisStrategy):
                     # Mask out all holes from the main case_mask
                     case_mask[final_hole_mask > 0] = 0
                     print("     [Result] All charging hole features successfully carved out from Case Mask.")
+
+                    # --- DEBUG VISUALIZATION: Save the Charging Holes debug image ---
+                    debug_hole_img = image.copy()
+                    cv2.rectangle(debug_hole_img, (int(largest_hole_box[0]), int(largest_hole_box[1])), (int(largest_hole_box[2]), int(largest_hole_box[3])), (0, 255, 0), 4)
+                    cv2.putText(debug_hole_img, "Main Charging Hole", (int(largest_hole_box[0]), int(max(30, largest_hole_box[1]-10))), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+                    for s_box in smaller_holes:
+                        cv2.rectangle(debug_hole_img, (int(s_box[0]), int(s_box[1])), (int(s_box[2]), int(s_box[3])), (255, 255, 0), 3)
+                        cv2.putText(debug_hole_img, "Hole", (int(s_box[0]), int(max(30, s_box[1]-10))), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 0), 2)
+                    # 绘制最终抠除的掩膜轮廓（红色）
+                    contours_hole, _ = cv2.findContours(final_hole_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    cv2.drawContours(debug_hole_img, contours_hole, -1, (0, 0, 255), 3)
+                    cv2.imwrite(os.path.join(reference_dir, f"{os.path.splitext(file)[0]}_01_debug_charging_holes.jpg"), debug_hole_img)
 
                 print(f"     [Result] Case W/H Ratio = {ratio:.2f}. Identified as: {face_name}")
                 
@@ -355,6 +354,8 @@ class ComplexTextileStrategy(AnalysisStrategy):
                 dino_dim = flow_row.iloc[0].get('Dino_Input_Dim', '[1280, 1280]') if not flow_row.empty else '[1280, 1280]'
                 if pd.isna(dino_dim): dino_dim = '[1280, 1280]'
 
+                # [CRITICAL FIX] 传入已经镂空扣除充电孔后的 case_mask，
+                # 这样 DINO 不会在被保护的孔洞/金属区域提取异常特征并染色
                 dino_result = dinov3_utils.process_single_image_pipeline(
                     image_path=img_path,
                     model=dino_model,
@@ -366,9 +367,6 @@ class ComplexTextileStrategy(AnalysisStrategy):
                     transparency_threshold=dino_threshold,
                     flooding_enabled=False,
                     dino_input_dim=dino_dim,
-                    # [CRITICAL] 必须传入完整的 case_mask！
-                    # 因为 DINO 内部会根据这个 mask 的外接矩形 (BBox) 去裁剪原图。
-                    # 如果传入 sliced_case_mask，原图就会被裁成只有一半高，导致送入 DINO 的比例严重失真放大。
                     contour_image=case_mask, 
                     post_ops=[]
                 )
@@ -493,9 +491,10 @@ class ComplexTextileStrategy(AnalysisStrategy):
                     
                     # 确保尺寸完全一致（理论上通过 restore_coords_func 恢复后是一致的）
                     if perfect_heatmap_bgr is not None and perfect_heatmap_bgr.shape[:2] == overlay_display.shape[:2]:
-                        mask_bool = sliced_case_mask > 0
-                        # 将有效切片区域替换为对齐后的热力图
-                        overlay_display[mask_bool] = perfect_heatmap_bgr[mask_bool]
+                        # [CRITICAL FIX] 仅在真正的织物有效区域 (case_mask > 0) 展示热力图
+                        # 已经被镂空扣除的充电孔、金属部件以及背景区域严格保持原图，绝不染色！
+                        valid_display_mask = (case_mask > 0)
+                        overlay_display[valid_display_mask] = perfect_heatmap_bgr[valid_display_mask]
                         
                         # 如果有检测到的缺陷，画出缺陷外轮廓线（黄色细线），既美观又清晰标明异常区域
                         if final_defect_mask is not None and np.any(final_defect_mask):
@@ -505,11 +504,11 @@ class ComplexTextileStrategy(AnalysisStrategy):
                     else:
                         print("     [Warning] Reference heatmap missing or shape mismatch. Falling back to simple overlay.")
                         from utils.cv_ops import create_overlay_image
-                        overlay_display = create_overlay_image(image, sliced_case_mask, color=(0, 0, 255), transparency=1.0)
+                        overlay_display = create_overlay_image(image, case_mask, color=(0, 0, 255), transparency=1.0)
                 else:
                     print("     [Warning] Reference heatmap not found. Falling back to simple overlay.")
                     from utils.cv_ops import create_overlay_image
-                    overlay_display = create_overlay_image(image, sliced_case_mask, color=(0, 0, 255), transparency=1.0)
+                    overlay_display = create_overlay_image(image, case_mask, color=(0, 0, 255), transparency=1.0)
 
                 # Draw penalty zone on overlay just for debug validation
                 if is_cd_face and np.any(penalty_mask):
