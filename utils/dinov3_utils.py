@@ -661,7 +661,14 @@ def process_single_image_pipeline(image_path, model, upsampler, device, save_dir
         if image.mode != 'RGB':
              image = image.convert('RGB')
     else:
-        image = Image.open(image_path).convert('RGB')
+        try:
+            image = Image.open(image_path).convert('RGB')
+        except OSError:
+            # 兼容截断或损坏图像：使用 cv2 读取并转为 PIL Image
+            cv_img = cv2.imread(image_path)
+            if cv_img is None:
+                raise
+            image = Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
 
     full_input_image = np.array(image) # Keep copy of full input for restoration
     full_input_h, full_input_w = full_input_image.shape[:2]
