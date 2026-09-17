@@ -37,10 +37,7 @@ from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 from sklearn.cluster import KMeans
 import re
-try:
-    import radarclient
-except ImportError:
-    radarclient = None
+import radarclient
 from datetime import datetime, timedelta
 import zipfile
 import shutil
