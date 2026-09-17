@@ -58,7 +58,24 @@ class ComplexTextileStrategy(AnalysisStrategy):
         print(f">>> [Strategy] Loading DINOv3 model for defect detection...")
         dino_weight_path = weights.get('dino') or weights.get('Dino') or weights.get('dinov3_weights')
         dino_model = dinov3_utils.load_model(dino_weight_path, torch.device(device_str))
-        upsampler = None # Skip AnyUp for now
+        
+        flow_df = cfg_mgr.get_sheet('Flow')
+        flow_row = flow_df[flow_df['Failure Mode'] == fm]
+        use_anyup = str(flow_row.iloc[0].get('Upsampling', '')).strip().lower() in ('yes', 'true', '1') if not flow_row.empty else False
+        upsampler = None
+        if use_anyup:
+            upsampler = dinov3_utils.load_anyup_upsampler(torch.device(device_str))
+            upsampling_def = flow_row.iloc[0].get('Upsampling Definition', None) if not flow_row.empty else None
+            ug.Upsampling_Target_Size = 448  # Default fallback value
+            if upsampling_def and str(upsampling_def).strip().lower() != 'nan':
+                try:
+                    custom_size = int(float(upsampling_def))
+                    if device_str == 'mps' and custom_size > 640:
+                        print(f">>> [ComplexTextileStrategy] DEBUG: MPS Device detected. Capping Upsampling Target Size from {custom_size} to 640.")
+                        custom_size = 640
+                    ug.Upsampling_Target_Size = custom_size
+                except Exception:
+                    pass
         
         # 结果保存路径
         project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -359,7 +376,7 @@ class ComplexTextileStrategy(AnalysisStrategy):
                 dino_result = dinov3_utils.process_single_image_pipeline(
                     image_path=img_path,
                     model=dino_model,
-                    upsampler=None,
+                    upsampler=upsampler,
                     device=torch.device(device_str),
                     save_dir=reference_dir,
                     super_resolution_factor=1.0,
