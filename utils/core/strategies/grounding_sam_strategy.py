@@ -354,10 +354,17 @@ class GroundingSamStrategy(AnalysisStrategy):
                     from utils.cv_ops import create_overlay_image
                     
                     # 检查是否有 DINO 生成的真实彩虹渐变热力图 (在 reference 目录下)
-                    dino_ref_overlay_path = os.path.join(reference_dir, f"{os.path.splitext(file)[0]}_overlay.png")
+                    candidate_heatmap_paths = [
+                        os.path.join(reference_dir, f"{os.path.splitext(file)[0]}_overlay_upsampled.png"),
+                        os.path.join(reference_dir, f"{os.path.splitext(file)[0]}_overlay.png"),
+                        os.path.join(reference_dir, f"{os.path.splitext(file)[0]}_overlay_anyup.png"),
+                    ]
                     dino_heatmap_loaded = None
-                    if os.path.exists(dino_ref_overlay_path):
-                        dino_heatmap_loaded = cv2.imread(dino_ref_overlay_path)
+                    for cp in candidate_heatmap_paths:
+                        if os.path.exists(cp):
+                            dino_heatmap_loaded = cv2.imread(cp)
+                            if dino_heatmap_loaded is not None:
+                                break
                     
                     if dino_heatmap_loaded is not None and sam_mask_total is not None and np.any(sam_mask_total):
                         if dino_heatmap_loaded.shape[:2] != image.shape[:2]:

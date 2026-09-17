@@ -1888,9 +1888,16 @@ def process_single_image_pipeline(image_path, model, upsampler, device, save_dir
                 if b is not None and g is not None and r is not None:
                     heatmap_on_image_to_save = cv2.merge([b, g, r])
                     
+            overlay_save_path = os.path.join(save_dir, f"{filename}_overlay{suffix}.png")
             cv2.imwrite(
-                os.path.join(save_dir, f"{filename}_overlay{suffix}.png"),
+                overlay_save_path,
                 cv2.cvtColor(heatmap_on_image_to_save, cv2.COLOR_RGB2BGR)
             )
+            # 兼容性保证：如果带有 _upsampled 等后缀，额外多存一份标准 _overlay.png，确保各 Strategy 均能命中
+            if suffix:
+                cv2.imwrite(
+                    os.path.join(save_dir, f"{filename}_overlay.png"),
+                    cv2.cvtColor(heatmap_on_image_to_save, cv2.COLOR_RGB2BGR)
+                )
 
         return heatmap_normalized, heatmap_transparent, heatmap_on_image, rgb_result_paths, binary_mask, mask_removed

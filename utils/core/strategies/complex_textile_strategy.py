@@ -497,18 +497,31 @@ class ComplexTextileStrategy(AnalysisStrategy):
                 parametric_results.extend(extracted_results)
                 
                 # Output Visual Overlay
-                # 修复: 从 reference 文件夹读取由 dinov3_utils 完美对齐并恢复坐标系后的 Heatmap 原图
-                # 避免 dino_heatmap_on_img 因为内部 crop 导致直接 resize 时出现的错位拉伸和黑边。
-                ref_heatmap_path = os.path.join(reference_dir, f"{os.path.splitext(file)[0]}_overlay.png")
+                # 修复: 从 reference 文件夹读取由 dinov3_utils 恢复坐标系后的 Heatmap 原图
+                # 兼容 AnyUp 开启（_overlay_upsampled.png）和未开启（_overlay.png / _overlay_anyup.png）
+                candidate_heatmap_paths = [
+                    os.path.join(reference_dir, f"{os.path.splitext(file)[0]}_overlay_upsampled.png"),
+                    os.path.join(reference_dir, f"{os.path.splitext(file)[0]}_overlay.png"),
+                    os.path.join(reference_dir, f"{os.path.splitext(file)[0]}_overlay_anyup.png"),
+                ]
+                
+                ref_heatmap_path = None
+                for cp in candidate_heatmap_paths:
+                    if os.path.exists(cp):
+                        ref_heatmap_path = cp
+                        break
                 
                 overlay_display = image.copy()
                 
-                if os.path.exists(ref_heatmap_path):
+                if ref_heatmap_path is not None:
                     perfect_heatmap_bgr = cv2.imread(ref_heatmap_path)
                     
-                    # 确保尺寸完全一致（理论上通过 restore_coords_func 恢复后是一致的）
-                    if perfect_heatmap_bgr is not None and perfect_heatmap_bgr.shape[:2] == overlay_display.shape[:2]:
-                        # [CRITICAL FIX] 仅在真正的织物有效区域 (case_mask > 0) 展示热力图
+                    if perfect_heatmap_bgr is not None:
+                        # 若尺寸有细微差异，做自适应对齐
+                        if perfect_heatmap_bgr.shape[:2] != overlay_display.shape[:2]:
+                            perfect_heatmap_bgr = cv2.resize(perfect_heatmap_bgr, (overlay_display.shape[1], overlay_display.shape[0]), interpolation=cv2.INTER_LINEAR)
+                            
+                        # [CRITICAL FIX] 仅在真正的织物有效区域 (case_mask > 0) 展示彩虹渐变热力图
                         # 已经被镂空扣除的充电孔、金属部件以及背景区域严格保持原图，绝不染色！
                         valid_display_mask = (case_mask > 0)
                         overlay_display[valid_display_mask] = perfect_heatmap_bgr[valid_display_mask]
@@ -519,13 +532,15 @@ class ComplexTextileStrategy(AnalysisStrategy):
                             contours_def, _ = cv2.findContours(defect_mask_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                             cv2.drawContours(overlay_display, contours_def, -1, (0, 255, 255), 2)
                     else:
-                        print("     [Warning] Reference heatmap missing or shape mismatch. Falling back to simple overlay.")
-                        from utils.cv_ops import create_overlay_image
-                        overlay_display = create_overlay_image(image, case_mask, color=(0, 0, 255), transparency=1.0)
+                        print("     [Warning] Reference heatmap could not be decoded. Falling back to defect overlay.")
+                        if final_defect_mask is not None and np.any(final_defect_mask):
+                            from utils.cv_ops import create_overlay_image
+                            overlay_display = create_overlay_image(image, final_defect_mask, color=(0, 0, 255), transparency=0.4)
                 else:
-                    print("     [Warning] Reference heatmap not found. Falling back to simple overlay.")
-                    from utils.cv_ops import create_overlay_image
-                    overlay_display = create_overlay_image(image, case_mask, color=(0, 0, 255), transparency=1.0)
+                    print(f"     [Warning] Reference heatmap not found among candidates. Falling back to defect overlay.")
+                    if final_defect_mask is not None and np.any(final_defect_mask):
+                        from utils.cv_ops import create_overlay_image
+                        overlay_display = create_overlay_image(image, final_defect_mask, color=(0, 0, 255), transparency=0.4)
 
                 # Draw penalty zone on overlay just for debug validation
                 if is_cd_face and np.any(penalty_mask):
