@@ -3311,8 +3311,7 @@ def format_parametric_dict(param_dict, path, ref_params, defect_output_format):
     # Defect/Ref%, Defect_Area_Pixels, Reference_BBox_Area are preserved
     area_ref_fields = ['Defect/Ref%', 'Defect_Area_Pixels', 'Reference_BBox_Area']
     has_area_ref = any(field in param_dict for field in area_ref_fields)
-    if has_area_ref:
-        print(f"DEBUG: format_parametric_dict - Preserving Area_Ref fields: {[f for f in area_ref_fields if f in param_dict]}")
+    # Silently preserve fields without spamming debug log per row/item
     
     return param_dict
 
