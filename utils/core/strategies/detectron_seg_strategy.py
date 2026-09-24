@@ -242,6 +242,10 @@ class DetectronSegStrategy(AnalysisStrategy):
                             print(f"     [Strategy] Outlier suppression active for row {row_idx}: DUTs={len(sub_boxes_full)}, SNs={len(sub_sn_series)}")
                             sub_boxes_full = bbox_outlier_supression(sub_boxes_full, 4, sub_sn_series.to_frame(), None)
                             
+                        if sub_boxes_full is None:
+                            print(f"     [Strategy] Warning: Bbox suppression returned None for row {row_idx}, skipping this row.")
+                            continue
+                            
                         # Retrieve the cleaned x1, y1, x2, y2 and sort by X axis (index 0)
                         sub_boxes = sub_boxes_full[:, :4]
                         sorted_sub_indices = sub_boxes[:, 0].argsort()
@@ -271,7 +275,11 @@ class DetectronSegStrategy(AnalysisStrategy):
                         sn_for_suppression = SN_df if isinstance(SN_df, pd.DataFrame) else SN_df.to_frame()
                         bbox_pending_suppression = bbox_outlier_supression(bbox_pending_suppression, sorting_strategy, sn_for_suppression, None)
                         
-                    boxes_coords = bbox_pending_suppression[:, :4]
+                    if bbox_pending_suppression is not None:
+                        boxes_coords = bbox_pending_suppression[:, :4]
+                    else:
+                        print(">>> [Strategy] Warning: Bbox suppression returned None, skipping image.")
+                        continue
                     
                     # 极其重要：如果是多行多列，但 Excel 只给了一列 SN，我们需要确保排序方式正确。
                     # 通常 sorting_strategy = 0 (按X排), 1 (按Y排)
