@@ -13,3 +13,6 @@ weights/
 # ignore uv environments rely
 uv.lock
 Result/
+# ignore local docs
+docs/
+GUI/
