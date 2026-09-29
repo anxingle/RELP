@@ -29,9 +29,13 @@ from utils.utils_general import apply_filtering
 from utils import utils_general
 
 # Modern AnyUp Integration
-anyup_path = os.path.join(project_root, 'Dinomaly', 'anyup-main')
-if anyup_path not in sys.path:
-    sys.path.append(anyup_path)
+anyup_candidates = [
+    os.path.join(project_root, 'anyup-main'),
+    os.path.join(project_root, 'Dinomaly', 'anyup-main')
+]
+for p in anyup_candidates:
+    if os.path.exists(p) and p not in sys.path:
+        sys.path.insert(0, p)
 
 try:
     from anyup.model import AnyUp
@@ -248,6 +252,12 @@ def load_model(model_path, device):
     
     if os.path.exists(model_path):
         state_dict = torch.load(model_path, map_location=device)
+        # 兼容包含训练元数据的 checkpoint 字典 (如 Dinomaly 保存的 model_state)
+        if isinstance(state_dict, dict):
+            for k in ['model_state', 'model', 'state_dict']:
+                if k in state_dict and isinstance(state_dict[k], dict):
+                    state_dict = state_dict[k]
+                    break
         model.load_state_dict(state_dict)
         print(f"Successfully loaded model weights: {model_path}")
     else:
