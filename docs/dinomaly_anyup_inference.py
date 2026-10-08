@@ -21,6 +21,7 @@ Specialized for Imprint and micro-defect detection analysis.
 #   --input_dim 448 \
 #   --upsample_sizes 160 320 448 640 \
 #   --compare_baseline \
+#   --save_csv \
 #   --threshold 0.15 \
 #   --device cpu
 #
@@ -57,6 +58,14 @@ Specialized for Imprint and micro-defect detection analysis.
 # 例如进程中途退出；读取失败记为 read_error。OOM 的拼图面板标记为 skipped。
 # --threshold 只影响二值 mask；热图使用各自的 Min-Max 归一化着色，
 # 因此不同图片/参数结果中的相同颜色不代表相同的绝对异常分数。
+# --save_csv 为每个成功方案额外保存供 Dino_threshold_analyzer_GUI.py 使用的：
+#   AnyUp_448/sample_AnyUp_448_anomaly_distance_raw.csv
+#   AnyUp_448/sample_AnyUp_448_original.png
+# CSV 是平滑后、按热图相同方式插值到输入图片尺寸的原始分数（无表头）。
+# 不做 Min-Max 归一化、阈值过滤或黑背景置零；配套 PNG 为本次输入图片。
+# GUI 的 Load CSV File 会自动匹配该 PNG。纯黑背景需要在 GUI 中排除；
+# GUI 不会自动套用本脚本渲染时 RGB <= 5 的背景排除规则。
+# 未开启 --save_csv 时不生成这些文件；重新运行会清除本次请求方案的旧导出。
 # | 文件后缀 | 含义 | 用途 |
 # |---|---|---|
 # | `_comparison_grid_heatmaps.jpg` | 原图、Baseline、AnyUp 160/320/448/640 的热图横向拼接 | 快速比较不同参数，与你提供的参考图对应 |
@@ -159,6 +168,11 @@ def parse_args():
         action="store_true",
         default=True,
         help="Include standard Bilinear interpolation (without AnyUp) as baseline in comparison"
+    )
+    parser.add_argument(
+        "--save_csv",
+        action="store_true",
+        help="Export raw score CSVs and paired PNGs for Dino_threshold_analyzer_GUI"
     )
     parser.add_argument(
         "--threshold",
@@ -439,6 +453,24 @@ def _save_image(path, image):
     if not cv2.imwrite(str(path), image):
         raise OSError(f"Failed to save image: {path}")
 
+def _analyzer_paths(output_dir, stem, method):
+    base = output_dir / method / f"{stem}_{method}"
+    return (base.with_name(base.name + "_anomaly_distance_raw.csv"),
+            base.with_name(base.name + "_original.png"))
+
+def _save_analyzer_data(output_dir, stem, method, orig_bgr, raw_map):
+    """Export unnormalized scores on the same grid used by the rendered mask."""
+    raw_map = np.asarray(raw_map)
+    if raw_map.ndim != 2 or not np.isfinite(raw_map).all():
+        raise ValueError("Analyzer export requires a finite 2D anomaly map")
+    h, w = orig_bgr.shape[:2]
+    aligned_map = cv2.resize(raw_map, (w, h), interpolation=cv2.INTER_LINEAR)
+    csv_path, image_path = _analyzer_paths(output_dir, stem, method)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savetxt(csv_path, aligned_map, delimiter=",", fmt="%.9g")
+    _save_image(image_path, orig_bgr)
+    print(f"✅ Saved analyzer CSV to: {csv_path}")
+
 def process_single_comparison(image_path, model, anyup, args, output_dir, device, gaussian_fn):
     image_path = Path(image_path)
     output_dir = Path(output_dir)
@@ -453,6 +485,8 @@ def process_single_comparison(image_path, model, anyup, args, output_dir, device
     # or interrupted run must not leave a previous run's files looking current.
     for method in methods:
         for path in _result_paths(output_dir, stem, method).values():
+            path.unlink(missing_ok=True)
+        for path in _analyzer_paths(output_dir, stem, method):
             path.unlink(missing_ok=True)
     for kind in ("overlays", "heatmaps"):
         (output_dir / f"{stem}_comparison_grid_{kind}.jpg").unlink(missing_ok=True)
@@ -579,6 +613,8 @@ def process_single_comparison(image_path, model, anyup, args, output_dir, device
         sub_dir.mkdir(parents=True, exist_ok=True)
         for kind, path in _result_paths(output_dir, stem, k).items():
             _save_image(path, v[kind])
+        if getattr(args, "save_csv", False):
+            _save_analyzer_data(output_dir, stem, k, orig_bgr, v["map"])
         statuses[k].update(status="success", message="")
         _write_status(status_path, statuses)
 
