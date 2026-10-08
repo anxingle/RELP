@@ -66,6 +66,10 @@ Specialized for Imprint and micro-defect detection analysis.
 # GUI 的 Load CSV File 会自动匹配该 PNG。纯黑背景需要在 GUI 中排除；
 # GUI 不会自动套用本脚本渲染时 RGB <= 5 的背景排除规则。
 # 未开启 --save_csv 时不生成这些文件；重新运行会清除本次请求方案的旧导出。
+# --resume 在相同模型与推理参数下续跑：仅跳过所有请求方案均 success 且
+# 对应文件齐全的图片；read_error/oom/pending/缺失文件的图片会重新处理。
+# 单张异常会记录 error（中断为 interrupted），批量结束打印完成/部分/失败数。
+# Windows 图片读写通过 Python 路径打开文件，支持中文及特殊字符文件名。
 # | 文件后缀 | 含义 | 用途 |
 # |---|---|---|
 # | `_comparison_grid_heatmaps.jpg` | 原图、Baseline、AnyUp 160/320/448/640 的热图横向拼接 | 快速比较不同参数，与你提供的参考图对应 |
@@ -80,6 +84,7 @@ import time
 import gc
 import argparse
 import csv
+import traceback
 from os import environ
 from pathlib import Path
 import cv2
@@ -173,6 +178,11 @@ def parse_args():
         "--save_csv",
         action="store_true",
         help="Export raw score CSVs and paired PNGs for Dino_threshold_analyzer_GUI"
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="With unchanged model/settings: skip images whose requested outputs are complete"
     )
     parser.add_argument(
         "--threshold",
@@ -450,8 +460,26 @@ def _write_status(path, statuses):
     temporary.replace(path)
 
 def _save_image(path, image):
-    if not cv2.imwrite(str(path), image):
+    # Let Python open the Unicode path; OpenCV only encodes the image in memory.
+    path = Path(path)
+    ok, encoded = cv2.imencode(path.suffix, image)
+    if not ok:
         raise OSError(f"Failed to save image: {path}")
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        with temporary.open("wb") as handle:
+            encoded.tofile(handle)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+def _load_image(path):
+    try:
+        with Path(path).open("rb") as handle:
+            encoded = np.fromfile(handle, dtype=np.uint8)
+        return cv2.imdecode(encoded, cv2.IMREAD_COLOR) if encoded.size else None
+    except (OSError, cv2.error):
+        return None
 
 def _analyzer_paths(output_dir, stem, method):
     base = output_dir / method / f"{stem}_{method}"
@@ -467,7 +495,12 @@ def _save_analyzer_data(output_dir, stem, method, orig_bgr, raw_map):
     aligned_map = cv2.resize(raw_map, (w, h), interpolation=cv2.INTER_LINEAR)
     csv_path, image_path = _analyzer_paths(output_dir, stem, method)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savetxt(csv_path, aligned_map, delimiter=",", fmt="%.9g")
+    temporary = csv_path.with_name(csv_path.name + ".tmp")
+    try:
+        np.savetxt(temporary, aligned_map, delimiter=",", fmt="%.9g")
+        temporary.replace(csv_path)
+    finally:
+        temporary.unlink(missing_ok=True)
     _save_image(image_path, orig_bgr)
     print(f"✅ Saved analyzer CSV to: {csv_path}")
 
@@ -494,7 +527,7 @@ def process_single_comparison(image_path, model, anyup, args, output_dir, device
     print(f"🔍 Analyzing Image: {filename}")
     print(f"=======================================================")
 
-    orig_bgr = cv2.imread(str(image_path))
+    orig_bgr = _load_image(image_path)
     if orig_bgr is None:
         print(f"Error loading {image_path}")
         for row in statuses.values():
@@ -622,7 +655,81 @@ def process_single_comparison(image_path, model, anyup, args, output_dir, device
     del img_tensor, en, de
     release_compute_memory(device)
 
+def _requested_methods(args):
+    return (["Baseline"] if args.compare_baseline else []) + [f"AnyUp_{size}" for size in args.upsample_sizes]
+
+def _read_status(path):
+    try:
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            return {row["method"]: {"status": row["status"], "message": row["message"]}
+                    for row in csv.DictReader(handle)}
+    except (OSError, KeyError, csv.Error, UnicodeError):
+        return {}
+
+def _image_is_complete(image_path, args, output_dir):
+    """Resume only committed successes; partial CSVs cannot be treated as done."""
+    stem = image_path.stem
+    statuses = _read_status(output_dir / f"{stem}_inference_status.csv")
+    for method in _requested_methods(args):
+        if statuses.get(method, {}).get("status") != "success":
+            return False
+        paths = list(_result_paths(output_dir, stem, method).values())
+        if getattr(args, "save_csv", False):
+            paths.extend(_analyzer_paths(output_dir, stem, method))
+        if not all(path.is_file() and path.stat().st_size > 0 for path in paths):
+            return False
+    return all((output_dir / f"{stem}_comparison_grid_{kind}.jpg").is_file()
+               for kind in ("overlays", "heatmaps"))
+
+def _record_image_failure(image_path, args, output_dir, exc, status="error"):
+    path = output_dir / f"{image_path.stem}_inference_status.csv"
+    statuses = _read_status(path)
+    for method in _requested_methods(args):
+        row = statuses.setdefault(method, {"status": "pending", "message": ""})
+        if row["status"] == "pending":
+            row.update(status=status, message=f"{type(exc).__name__}: {exc}")
+    _write_status(path, statuses)
+
+def _run_image_batch(images, model, anyup, args, output_dir, device, gaussian_fn):
+    counts = {"completed": 0, "skipped": 0, "partial": 0, "failed": 0}
+    for number, image_path in enumerate(images, 1):
+        if getattr(args, "resume", False) and _image_is_complete(image_path, args, output_dir):
+            counts["skipped"] += 1
+            print(f"[{number}/{len(images)}] Already complete: {image_path.name}")
+            continue
+        print(f"[{number}/{len(images)}] Processing: {image_path.name}")
+        try:
+            process_single_comparison(image_path, model, anyup, args, output_dir, device, gaussian_fn)
+        except KeyboardInterrupt as exc:
+            _record_image_failure(image_path, args, output_dir, exc, status="interrupted")
+            raise
+        except Exception as exc:
+            print(f"ERROR: {image_path.name}: {type(exc).__name__}: {exc}")
+            traceback.print_exc()
+            try:
+                _record_image_failure(image_path, args, output_dir, exc)
+            except OSError as status_exc:
+                print(f"ERROR: Could not record failure status: {status_exc}")
+        finally:
+            # Includes read, inference and export failures before advancing.
+            release_compute_memory(device)
+        if _image_is_complete(image_path, args, output_dir):
+            counts["completed"] += 1
+        else:
+            rows = _read_status(output_dir / f"{image_path.stem}_inference_status.csv")
+            if any(rows.get(method, {}).get("status") == "success" for method in _requested_methods(args)):
+                counts["partial"] += 1
+            else:
+                counts["failed"] += 1
+    print(f"Batch summary: total={len(images)}, completed={counts['completed']}, "
+          f"skipped={counts['skipped']}, partial={counts['partial']}, failed={counts['failed']}")
+    return counts
+
 def main():
+    # Redirected PowerShell output may default to a code page without Chinese/emoji.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     args = parse_args()
     device = torch.device(args.device)
     output_dir = args.output_dir
@@ -659,7 +766,7 @@ def main():
         images_to_run = [args.image_path]
     elif args.image_dir:
         exts = {".jpg", ".jpeg", ".png", ".bmp"}
-        images_to_run = sorted(p for p in args.image_dir.iterdir() if p.suffix.lower() in exts)
+        images_to_run = sorted(p for p in args.image_dir.iterdir() if p.is_file() and p.suffix.lower() in exts)
     else:
         # Default sample from train_imprint or test_imprint
         sample_cand = Path("/Users/an/workspace/imprint_datasets/test_imprint")
@@ -670,11 +777,13 @@ def main():
             return
 
     print(f"\n[*] Processing {len(images_to_run)} images on device: {device}...")
-    for img_p in images_to_run:
-        process_single_comparison(img_p, model, anyup, args, output_dir, device, gaussian_fn)
+    counts = _run_image_batch(images_to_run, model, anyup, args, output_dir, device, gaussian_fn)
 
     print("\n" + "=" * 60)
-    print(f"🎉 All experiments completed! Check results in: {output_dir}")
+    if counts["partial"] or counts["failed"]:
+        print(f"Batch finished with incomplete images. Check *_inference_status.csv in: {output_dir}")
+    else:
+        print(f"🎉 All experiments completed! Check results in: {output_dir}")
     print("=" * 60)
 
 if __name__ == "__main__":
