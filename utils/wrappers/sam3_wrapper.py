@@ -1,8 +1,31 @@
 """SAM3 本地图像分割封装（官方 sam3 包，不需要 SAM2 的 YAML 配置）。
 
-默认资源均相对 RELP 根目录定位，不依赖当前工作目录：
-    weights/sam3/checkpoints/sam3.pt
-    weights/sam3/assets/bpe_simple_vocab_16e6.txt.gz
+资源目录（以下路径均相对 RELP 仓库根目录）：
+    RELP/
+    ├─ utils/wrappers/sam3_wrapper.py
+    ├─ docs/dut_and_center_sam3.py
+    └─ weights/sam3/
+       ├─ checkpoints/sam3.pt                  # 官方 SAM3 图像模型权重
+       └─ assets/bpe_simple_vocab_16e6.txt.gz  # 文本提示分词用 BPE 词表
+
+配置说明：这个官方图像模型不需要 SAM2 风格的 YAML 或单独 config_path。
+模型结构由已安装 sam3 包中的 sam3/model_builder.py 定义；本 wrapper 不
+读取 Hugging Face 模型库的 config.json，也不需要将它另存到 weights/。
+安装 sam3 包仍是必要条件，单独放置上述两个资源文件不能替代 Python 包。
+
+常规初始化（推荐）：
+    from utils.wrappers.sam3_wrapper import init_sam3
+    predictor = init_sam3(device="cuda")
+
+默认 checkpoint/BPE 通过本文件位置定位到仓库根目录，不依赖当前工作目录。
+若要显式指定资源，可从 RELP 根目录使用以下相对路径：
+    predictor = init_sam3(
+        checkpoint_path="weights/sam3/checkpoints/sam3.pt",
+        bpe_path="weights/sam3/assets/bpe_simple_vocab_16e6.txt.gz",
+        device="cuda",
+    )
+注意：显式传入的相对路径按调用进程的当前工作目录解析；从其他目录调用时，
+优先省略这两个参数使用默认值，或自行以仓库根目录拼接路径。
 
 两个文件必须事先存在。builder 始终传 load_from_HF=False；本模块不下载
 任何文件，也不改变进程的 HF 环境变量，以免影响 Grounding DINO 等其他模型。
@@ -338,6 +361,9 @@ def init_sam3(
 ) -> SAM3Predictor:
     """对应 init_sam2 的初始化入口；SAM3 不需要单独 config_path。
 
+    默认资源：weights/sam3/checkpoints/sam3.pt 与
+    weights/sam3/assets/bpe_simple_vocab_16e6.txt.gz（锚定 RELP 根目录）。
+    若显式传入相对路径，则按当前工作目录解析，推荐在 RELP 根目录调用。
     失败抛出带原始原因的异常，避免返回 None 后批处理静默漏掉 DUT 分割。
     """
     return SAM3Predictor(

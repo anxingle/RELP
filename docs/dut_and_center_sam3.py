@@ -1,10 +1,28 @@
 #!/usr/bin/env python3
 """用本地 SAM3 提取 DUT，再按 imprint 脚本的流程裁剪、等比缩放、居中。
 
+模型资源目录（相对 RELP 仓库根目录）：
+    utils/wrappers/sam3_wrapper.py             # SAM3 本地加载/预测接口
+    weights/sam3/checkpoints/sam3.pt           # 官方 SAM3 权重
+    weights/sam3/assets/bpe_simple_vocab_16e6.txt.gz  # 本地 BPE 词表
+
+不需要单独的 SAM3 YAML/config_path。模型结构由已安装 sam3 包中的
+sam3/model_builder.py 定义，本脚本不使用 Hugging Face 的 config.json。
+权重和词表必须已放置到本地，运行时不下载；CUDA/BF16 和依赖安装说明见
+utils/wrappers/sam3_wrapper.py 的模块注释。
+
 从 RELP 根目录运行（PowerShell）：
     .venv/Scripts/python.exe -X utf8 -B docs/dut_and_center_sam3.py `
         --input_dir ../Dinomaly/data/20261011_T0 `
-        --output_dir Result/center_sam3 --save_masks --save_debug --limit 4
+        --output_dir Result/center_sam3 `
+        --checkpoint_path weights/sam3/checkpoints/sam3.pt `
+        --bpe_path weights/sam3/assets/bpe_simple_vocab_16e6.txt.gz `
+        --output_format png --save_masks --save_debug --limit 4
+
+--checkpoint_path 和 --bpe_path 可省略：默认值由 wrapper 锚定仓库根目录，
+不受当前工作目录影响。显式指定的相对资源路径及 input/output 路径则按
+当前工作目录解析，所以以上示例应从 RELP 根目录执行。若在其他目录启动，
+可省略资源参数使用默认值，并为输入/输出传入适合该工作目录的路径。
 
 算法：每张 RGB 图只编码一次；用简短 SAM3 文本提示找实例，筛除空 mask、
 异常面积和非有限分数，再选择/合并。--prompt 可重复，按顺序尝试，第一次
