@@ -214,10 +214,10 @@ def main():
         h_orig, w_orig = image_bgr.shape[:2]
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
 
-        # Step A: Grounding DINO Detection
-        detections = gd_model.predict(image_rgb, args.prompt)
+        # Step A: The Grounding DINO wrapper converts BGR arrays to RGB internally.
+        detections = gd_model.predict(image_bgr, args.prompt)
         if not detections:
-            detections = gd_model.predict(image_rgb, "object")
+            detections = gd_model.predict(image_bgr, "object")
 
         if not detections:
             print(f"[{idx}/{len(image_paths)}] ⚠️ No detection for {filename}, using center fallback.")
@@ -233,7 +233,7 @@ def main():
             valid_dets = sorted(valid_dets, key=lambda x: x["score"], reverse=True)
             box = np.array(valid_dets[0]["bbox"]).astype(int)
 
-        # Step B: SAM 2 Segmentation
+        # Step B: SAM 2 expects RGB, unlike the Grounding DINO wrapper above.
         sam_predictor.set_image(image_rgb)
         masks, scores, _ = sam_predictor.predict(
             point_coords=None,
